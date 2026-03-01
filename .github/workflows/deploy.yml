@@ -59,8 +59,6 @@ jobs:
           --min-instances 0 \
           --project ${{ secrets.GCP_PROJECT_ID }} \
           --service-account ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }} \
-          --set-env-vars "RATE_LIMIT=1000" \
-          --set-env-vars "RATE_WINDOW_MINUTES=10" \
           --set-env-vars "RESPONSE_MAX_LENGTH=50000" \
           --allow-unauthenticated
 

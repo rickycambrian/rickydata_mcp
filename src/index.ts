@@ -12,8 +12,6 @@ import { marketplaceManager, MARKETPLACE_TOOLS } from "./marketplace.js";
 // CONFIGURATION
 // ============================================================================
 
-const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT || "1000", 10);
-const RATE_WINDOW_MINUTES = parseInt(process.env.RATE_WINDOW_MINUTES || "10", 10);
 const RESPONSE_MAX_LENGTH = parseInt(process.env.RESPONSE_MAX_LENGTH || "50000", 10);
 const CANVAS_API_URL = process.env.CANVAS_API_URL || "https://agents.rickydata.org";
 const AGENT_GATEWAY_URL = process.env.AGENT_GATEWAY_URL || "https://agents.rickydata.org";
@@ -591,7 +589,11 @@ const app = express();
 app.set("trust proxy", 1);
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
-app.use(rateLimit({ windowMs: RATE_WINDOW_MINUTES * 60 * 1000, max: RATE_LIMIT_MAX, validate: { xForwardedForHeader: false } }));
+// Permissive rate limits: 1k/min, 10k/10min, 50k/hr
+const rlOpts = { validate: { xForwardedForHeader: false }, standardHeaders: true, legacyHeaders: false };
+app.use(rateLimit({ windowMs: 1 * 60 * 1000, max: 1000, ...rlOpts }));
+app.use(rateLimit({ windowMs: 10 * 60 * 1000, max: 10000, ...rlOpts }));
+app.use(rateLimit({ windowMs: 60 * 60 * 1000, max: 50000, ...rlOpts }));
 
 // Auth middleware — wallet tokens only
 // Users authenticate via `rickydata auth login` and connect via `rickydata mcp connect-server`
