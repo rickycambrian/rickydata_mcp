@@ -13,7 +13,7 @@ import { MarketplaceManager, MARKETPLACE_TOOLS } from "./marketplace.js";
 // CONFIGURATION
 // ============================================================================
 
-const RESPONSE_MAX_LENGTH = parseInt(process.env.RESPONSE_MAX_LENGTH || "50000", 10);
+const RESPONSE_MAX_LENGTH = parseInt(process.env.RESPONSE_MAX_LENGTH || "200000", 10);
 const CANVAS_API_URL = process.env.CANVAS_API_URL || "https://agents.rickydata.org";
 const AGENT_GATEWAY_URL = process.env.AGENT_GATEWAY_URL || "https://agents.rickydata.org";
 
@@ -34,10 +34,8 @@ async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: nu
 function truncateResponse(data: any): any {
   const text = typeof data === "string" ? data : JSON.stringify(data);
   if (text.length <= RESPONSE_MAX_LENGTH) return data;
-  const truncated = text.slice(0, RESPONSE_MAX_LENGTH);
-  return typeof data === "string"
-    ? truncated + `\n... [truncated at ${RESPONSE_MAX_LENGTH} chars]`
-    : JSON.parse(truncated.slice(0, truncated.lastIndexOf("}") + 1) || "{}");
+  // For large responses, return as truncated string to avoid broken JSON
+  return text.slice(0, RESPONSE_MAX_LENGTH) + `\n... [truncated at ${RESPONSE_MAX_LENGTH} chars of ${text.length} total]`;
 }
 
 // ============================================================================
