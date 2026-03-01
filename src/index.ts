@@ -270,6 +270,38 @@ const TOOLS = [...CANVAS_TOOLS, ...AGENT_TOOLS, ...MARKETPLACE_TOOLS];
 // CANVAS TOOL HANDLERS
 // ============================================================================
 
+/** Parse an SSE response from the canvas execution endpoint into a structured result. */
+function parseSSEResult(sseText: string): any {
+  const events: any[] = [];
+  let runId = "";
+  let status = "unknown";
+  let results: Record<string, any> = {};
+  const logs: string[] = [];
+
+  for (const line of sseText.split("\n")) {
+    const dataStr = line.startsWith("data: ") ? line.slice(6) : line.startsWith("data:") ? line.slice(5) : null;
+    if (!dataStr || dataStr === "[DONE]") continue;
+    try {
+      const event = JSON.parse(dataStr);
+      events.push(event);
+      if (event.type === "run_started") runId = event.data?.runId || runId;
+      if (event.type === "node_log") logs.push(event.data?.message || "");
+      if (event.type === "run_completed") {
+        runId = event.data?.runId || runId;
+        status = event.data?.status || "completed";
+        results = event.data?.results || results;
+      }
+      if (event.type === "run_failed") {
+        runId = event.data?.runId || runId;
+        status = event.data?.status || "failed";
+      }
+      if (event.type === "error") status = "failed";
+    } catch { /* skip malformed lines */ }
+  }
+
+  return { runId, status, results, logs, event_count: events.length };
+}
+
 async function handleCanvasTool(name: string, args: Record<string, any>, marketplace: MarketplaceManager): Promise<any> {
   const token = marketplace.getUserToken();
   if (!token) throw new Error("No auth token. Authenticate with a wallet token first.");
@@ -294,28 +326,33 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
     }
 
     case "canvas_execute_workflow": {
+      // Synchronous execution via SSE streaming — collect all events and return final result
       const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/canvas/workflows/execute-sync`,
+        `${CANVAS_API_URL}/canvas/workflows/execute/stream`,
         { method: "POST", headers, body: JSON.stringify(args) },
         300000
       );
       if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
-      return await response.json();
+      const sseText = await response.text();
+      return parseSSEResult(sseText);
     }
 
     case "canvas_execute_workflow_async": {
+      // Async execution via SSE — return run ID immediately after run_started event
       const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/canvas/workflows/execute-async`,
+        `${CANVAS_API_URL}/canvas/workflows/execute/stream`,
         { method: "POST", headers, body: JSON.stringify(args) },
         30000
       );
       if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
-      return await response.json();
+      const sseText = await response.text();
+      const result = parseSSEResult(sseText);
+      return { runId: result.runId, status: result.status, message: `Workflow started. Use canvas_get_workflow_run("${result.runId}") to check status.` };
     }
 
     case "canvas_get_workflow_run": {
       const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/canvas/workflows/runs/${args.runId}`,
+        `${CANVAS_API_URL}/canvas/runs/${args.runId}`,
         { headers },
         15000
       );
@@ -329,7 +366,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       if (args.node_id) params.append("node_id", args.node_id);
       if (args.limit) params.append("limit", String(args.limit));
       const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/canvas/workflows/runs/${args.run_id}/messages?${params}`,
+        `${CANVAS_API_URL}/canvas/runs/${args.run_id}/messages?${params}`,
         { headers },
         15000
       );
@@ -342,7 +379,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       if (args.status) params.append("status", args.status);
       if (args.limit) params.append("limit", String(args.limit));
       const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/canvas/workflows/runs?${params}`,
+        `${CANVAS_API_URL}/canvas/runs?${params}`,
         { headers },
         15000
       );
@@ -374,47 +411,67 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
     }
 
     case "run_saved_canvas_workflow": {
+      // Load saved workflow and execute via SSE
+      const wfResponse = await fetchWithTimeout(
+        `${CANVAS_API_URL}/canvas/workflows`,
+        { headers },
+        15000
+      );
+      if (!wfResponse.ok) throw new Error(`Failed to load workflows: ${await wfResponse.text()}`);
+      const wfData = await wfResponse.json() as any;
+      const workflows = wfData.workflows || [];
+      const wf = workflows.find((w: any) => w.entityId === args.workflow_id || w.name === args.workflow_id);
+      if (!wf) throw new Error(`Workflow "${args.workflow_id}" not found`);
+
+      const nodes = typeof wf.nodesJson === "string" ? JSON.parse(wf.nodesJson) : wf.nodes;
+      const edges = typeof wf.edgesJson === "string" ? JSON.parse(wf.edgesJson) : wf.edges;
+      const request: Record<string, any> = {
+        nodes: nodes.map((n: any) => ({ id: n.id, type: n.type, data: n.data })),
+        connections: edges.map((e: any) => ({ source: e.source, target: e.target })),
+        ...(args.inputs ? { inputs: args.inputs } : {})
+      };
+
       const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/canvas/workflows/run`,
-        { method: "POST", headers, body: JSON.stringify(args) },
-        30000
+        `${CANVAS_API_URL}/canvas/workflows/execute/stream`,
+        { method: "POST", headers, body: JSON.stringify(request) },
+        300000
       );
       if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
-      return await response.json();
+      const sseText = await response.text();
+      return parseSSEResult(sseText);
     }
 
     case "run_workflow_and_wait": {
-      // Start workflow
-      const startResponse = await fetchWithTimeout(
-        `${CANVAS_API_URL}/canvas/workflows/run`,
-        { method: "POST", headers, body: JSON.stringify(args) },
-        30000
+      // Same as run_saved_canvas_workflow — SSE blocks until completion
+      const wfResponse = await fetchWithTimeout(
+        `${CANVAS_API_URL}/canvas/workflows`,
+        { headers },
+        15000
       );
-      if (!startResponse.ok) throw new Error(`Failed to start: ${await startResponse.text()}`);
-      const startResult = await startResponse.json() as any;
-      const runId = startResult.runId || startResult.run_id;
-      if (!runId) throw new Error("No run_id returned");
+      if (!wfResponse.ok) throw new Error(`Failed to load workflows: ${await wfResponse.text()}`);
+      const wfData = await wfResponse.json() as any;
+      const workflows = wfData.workflows || [];
+      const wf = workflows.find((w: any) => w.entityId === args.workflow_id || w.name === args.workflow_id);
+      if (!wf) throw new Error(`Workflow "${args.workflow_id}" not found`);
 
-      // Poll for completion
-      const maxWait = Math.min(args.max_wait_seconds || 300, 600) * 1000;
-      const interval = (args.poll_interval_seconds || 5) * 1000;
+      const nodes = typeof wf.nodesJson === "string" ? JSON.parse(wf.nodesJson) : wf.nodes;
+      const edges = typeof wf.edgesJson === "string" ? JSON.parse(wf.edgesJson) : wf.edges;
+      const request: Record<string, any> = {
+        nodes: nodes.map((n: any) => ({ id: n.id, type: n.type, data: n.data })),
+        connections: edges.map((e: any) => ({ source: e.source, target: e.target })),
+        ...(args.inputs ? { inputs: args.inputs } : {})
+      };
+
       const start = Date.now();
-
-      while (Date.now() - start < maxWait) {
-        await new Promise(r => setTimeout(r, interval));
-        const pollResponse = await fetchWithTimeout(
-          `${CANVAS_API_URL}/canvas/workflows/runs/${runId}`,
-          { headers },
-          15000
-        );
-        if (!pollResponse.ok) continue;
-        const pollResult = await pollResponse.json() as any;
-        if (pollResult.status === "completed" || pollResult.status === "failed") {
-          return { ...pollResult, run_id: runId, elapsed_seconds: Math.round((Date.now() - start) / 1000) };
-        }
-      }
-
-      return { status: "timeout", run_id: runId, elapsed_seconds: Math.round((Date.now() - start) / 1000), message: `Still running after ${Math.round((Date.now() - start) / 1000)}s. Use canvas_get_workflow_run("${runId}") to check later.` };
+      const response = await fetchWithTimeout(
+        `${CANVAS_API_URL}/canvas/workflows/execute/stream`,
+        { method: "POST", headers, body: JSON.stringify(request) },
+        Math.min(args.max_wait_seconds || 300, 600) * 1000
+      );
+      if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
+      const sseText = await response.text();
+      const result = parseSSEResult(sseText);
+      return { ...result, elapsed_seconds: Math.round((Date.now() - start) / 1000) };
     }
 
     case "update_canvas_workflow": {
