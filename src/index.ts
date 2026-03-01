@@ -283,7 +283,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
   switch (name) {
     case "canvas_get_available_tools": {
       const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/api/canvas/available-tools`,
+        `${CANVAS_API_URL}/canvas/available-tools`,
         { headers },
         15000
       );
@@ -297,7 +297,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
 
     case "canvas_execute_workflow": {
       const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/api/canvas/workflows/execute-sync`,
+        `${CANVAS_API_URL}/canvas/workflows/execute-sync`,
         { method: "POST", headers, body: JSON.stringify(args) },
         300000
       );
@@ -307,7 +307,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
 
     case "canvas_execute_workflow_async": {
       const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/api/canvas/workflows/execute-async`,
+        `${CANVAS_API_URL}/canvas/workflows/execute-async`,
         { method: "POST", headers, body: JSON.stringify(args) },
         30000
       );
@@ -317,7 +317,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
 
     case "canvas_get_workflow_run": {
       const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/api/canvas/workflows/runs/${args.runId}`,
+        `${CANVAS_API_URL}/canvas/workflows/runs/${args.runId}`,
         { headers },
         15000
       );
@@ -331,7 +331,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       if (args.node_id) params.append("node_id", args.node_id);
       if (args.limit) params.append("limit", String(args.limit));
       const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/api/canvas/workflows/runs/${args.run_id}/messages?${params}`,
+        `${CANVAS_API_URL}/canvas/workflows/runs/${args.run_id}/messages?${params}`,
         { headers },
         15000
       );
@@ -344,7 +344,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       if (args.status) params.append("status", args.status);
       if (args.limit) params.append("limit", String(args.limit));
       const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/api/canvas/workflows/runs?${params}`,
+        `${CANVAS_API_URL}/canvas/workflows/runs?${params}`,
         { headers },
         15000
       );
@@ -354,7 +354,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
 
     case "canvas_save_workflow": {
       const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/api/canvas/workflows`,
+        `${CANVAS_API_URL}/canvas/workflows`,
         { method: "POST", headers, body: JSON.stringify(args) },
         15000
       );
@@ -367,7 +367,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       if (args.search) params.append("search", args.search);
       if (args.limit) params.append("limit", String(args.limit));
       const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/api/canvas/workflows?${params}`,
+        `${CANVAS_API_URL}/canvas/workflows?${params}`,
         { headers },
         15000
       );
@@ -377,7 +377,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
 
     case "run_saved_canvas_workflow": {
       const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/api/canvas/workflows/run`,
+        `${CANVAS_API_URL}/canvas/workflows/run`,
         { method: "POST", headers, body: JSON.stringify(args) },
         30000
       );
@@ -388,7 +388,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
     case "run_workflow_and_wait": {
       // Start workflow
       const startResponse = await fetchWithTimeout(
-        `${CANVAS_API_URL}/api/canvas/workflows/run`,
+        `${CANVAS_API_URL}/canvas/workflows/run`,
         { method: "POST", headers, body: JSON.stringify(args) },
         30000
       );
@@ -405,7 +405,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       while (Date.now() - start < maxWait) {
         await new Promise(r => setTimeout(r, interval));
         const pollResponse = await fetchWithTimeout(
-          `${CANVAS_API_URL}/api/canvas/workflows/runs/${runId}`,
+          `${CANVAS_API_URL}/canvas/workflows/runs/${runId}`,
           { headers },
           15000
         );
@@ -422,7 +422,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
     case "update_canvas_workflow": {
       const { workflow_id, ...updates } = args;
       const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/api/canvas/workflows/${workflow_id}`,
+        `${CANVAS_API_URL}/canvas/workflows/${workflow_id}`,
         { method: "PUT", headers, body: JSON.stringify(updates) },
         15000
       );
@@ -433,7 +433,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
     case "update_workflow_node": {
       const { workflow_id, node_id, config_updates, name: nodeName } = args;
       const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/api/canvas/workflows/${workflow_id}/nodes/${node_id}`,
+        `${CANVAS_API_URL}/canvas/workflows/${workflow_id}/nodes/${node_id}`,
         { method: "PATCH", headers, body: JSON.stringify({ config_updates, name: nodeName }) },
         15000
       );
@@ -442,9 +442,9 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
     }
 
     case "canvas_ai_assistant": {
-      const toolsResponse = await fetch(`${CANVAS_API_URL}/api/canvas/available-tools`, { headers });
+      const toolsResponse = await fetch(`${CANVAS_API_URL}/canvas/available-tools`, { headers });
       const availableTools = toolsResponse.ok ? await toolsResponse.json() : null;
-      const response = await fetch(`${CANVAS_API_URL}/api/canvas/ai-assistant`, {
+      const response = await fetch(`${CANVAS_API_URL}/canvas/ai-assistant`, {
         method: "POST",
         headers,
         body: JSON.stringify({
@@ -458,9 +458,9 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
     }
 
     case "canvas_ai_assistant_voice": {
-      const toolsResponse = await fetch(`${CANVAS_API_URL}/api/canvas/available-tools`, { headers });
+      const toolsResponse = await fetch(`${CANVAS_API_URL}/canvas/available-tools`, { headers });
       const availableTools = toolsResponse.ok ? await toolsResponse.json() : null;
-      const response = await fetch(`${CANVAS_API_URL}/api/canvas/ai-assistant`, {
+      const response = await fetch(`${CANVAS_API_URL}/canvas/ai-assistant`, {
         method: "POST",
         headers,
         body: JSON.stringify({
@@ -660,17 +660,7 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
-function createMCPSession(userToken: string): MCPSession {
-  const marketplace = new MarketplaceManager();
-  marketplace.setUserToken(userToken);
-
-  const server = new Server(
-    { name: "rickydata", version: "1.0.0" },
-    { capabilities: { tools: { listChanged: true } } }
-  );
-
-  marketplace.setServer(server);
-
+function setupMCPHandlers(server: Server, marketplace: MarketplaceManager): void {
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [...TOOLS, ...marketplace.getDynamicTools()]
   }));
@@ -708,10 +698,6 @@ function createMCPSession(userToken: string): MCPSession {
       content: [{ type: "text", text: typeof content === "string" ? content : JSON.stringify(content, null, 2) }]
     };
   });
-
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID() });
-
-  return { server, transport, marketplace, createdAt: Date.now() };
 }
 
 // HTTP routes — session-based: state persists across requests
@@ -720,20 +706,30 @@ app.post("/mcp", authMiddleware, async (req, res) => {
   const userToken = typeof authHeader === "string" ? authHeader.replace("Bearer ", "") : "";
 
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  let session: MCPSession;
 
   if (sessionId && sessions.has(sessionId)) {
-    session = sessions.get(sessionId)!;
+    const session = sessions.get(sessionId)!;
     session.marketplace.setUserToken(userToken);
+    await session.transport.handleRequest(req, res, req.body);
   } else {
-    session = createMCPSession(userToken);
-    await session.server.connect(session.transport);
-    // Store session after connect so the transport has assigned its ID
-    const newId = (session.transport as any).sessionId;
-    if (newId) sessions.set(newId, session);
-  }
+    // New session: pre-generate ID so we can store it before handleRequest
+    const newId = randomUUID();
+    const marketplace = new MarketplaceManager();
+    marketplace.setUserToken(userToken);
 
-  await session.transport.handleRequest(req, res, req.body);
+    const server = new Server(
+      { name: "rickydata", version: "1.0.0" },
+      { capabilities: { tools: { listChanged: true } } }
+    );
+    marketplace.setServer(server);
+    setupMCPHandlers(server, marketplace);
+
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => newId });
+    await server.connect(transport);
+
+    sessions.set(newId, { server, transport, marketplace, createdAt: Date.now() });
+    await transport.handleRequest(req, res, req.body);
+  }
 });
 
 app.get("/mcp", authMiddleware, async (req, res) => {
