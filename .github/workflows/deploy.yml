@@ -59,14 +59,9 @@ jobs:
           --min-instances 0 \
           --project ${{ secrets.GCP_PROJECT_ID }} \
           --service-account ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }} \
-          --set-env-vars "REQUIRE_AUTH=true" \
           --set-env-vars "RATE_LIMIT=1000" \
           --set-env-vars "RATE_WINDOW_MINUTES=10" \
           --set-env-vars "RESPONSE_MAX_LENGTH=50000" \
-          --set-env-vars "CANVAS_API_URL=${{ secrets.CANVAS_API_URL }}" \
-          --set-env-vars "CANVAS_SERVICE_TOKEN=${{ secrets.CANVAS_SERVICE_TOKEN }}" \
-          --set-env-vars "AGENT_GATEWAY_URL=${{ secrets.AGENT_GATEWAY_URL }}" \
-          --set-env-vars "USER_RICKY_KEY=${{ secrets.USER_RICKY_KEY }}" \
           --allow-unauthenticated
 
     - name: Get Service URL

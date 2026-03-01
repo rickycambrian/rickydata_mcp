@@ -12,25 +12,11 @@ import { marketplaceManager, MARKETPLACE_TOOLS } from "./marketplace.js";
 // CONFIGURATION
 // ============================================================================
 
-const REQUIRE_AUTH = process.env.REQUIRE_AUTH === "true";
-const RATE_LIMIT = parseInt(process.env.RATE_LIMIT || "1000", 10);
+const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT || "1000", 10);
 const RATE_WINDOW_MINUTES = parseInt(process.env.RATE_WINDOW_MINUTES || "10", 10);
 const RESPONSE_MAX_LENGTH = parseInt(process.env.RESPONSE_MAX_LENGTH || "50000", 10);
 const CANVAS_API_URL = process.env.CANVAS_API_URL || "https://agents.rickydata.org";
-const CANVAS_SERVICE_TOKEN = process.env.CANVAS_SERVICE_TOKEN || "";
 const AGENT_GATEWAY_URL = process.env.AGENT_GATEWAY_URL || "https://agents.rickydata.org";
-
-// User API key mapping
-const USER_API_KEYS: Record<string, string> = {};
-for (const [key, value] of Object.entries(process.env)) {
-  if (key.startsWith("USER_") && key.endsWith("_KEY") && value) {
-    const name = key.slice(5, -4).charAt(0) + key.slice(6, -4).toLowerCase();
-    USER_API_KEYS[value] = name;
-  }
-}
-if (CANVAS_SERVICE_TOKEN) {
-  USER_API_KEYS[CANVAS_SERVICE_TOKEN] = "ServiceAccount";
-}
 
 // ============================================================================
 // HELPERS
@@ -288,11 +274,11 @@ const TOOLS = [...CANVAS_TOOLS, ...AGENT_TOOLS, ...MARKETPLACE_TOOLS];
 // ============================================================================
 
 async function handleCanvasTool(name: string, args: Record<string, any>): Promise<any> {
-  const token = marketplaceManager.getUserToken() || CANVAS_SERVICE_TOKEN;
+  const token = marketplaceManager.getUserToken();
+  if (!token) throw new Error("No auth token. Authenticate with a wallet token first.");
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
-    ...(token ? { "Authorization": `Bearer ${token}` } : {}),
-    ...(CANVAS_SERVICE_TOKEN ? { "X-Service-Token": CANVAS_SERVICE_TOKEN } : {})
+    "Authorization": `Bearer ${token}`
   };
 
   switch (name) {
@@ -503,7 +489,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>): Promis
 // ============================================================================
 
 async function handleAgentTool(name: string, args: Record<string, any>): Promise<any> {
-  const token = marketplaceManager.getUserToken() || CANVAS_SERVICE_TOKEN;
+  const token = marketplaceManager.getUserToken();
 
   switch (name) {
     case "agent_list": {
@@ -604,36 +590,31 @@ async function handleAgentTool(name: string, args: Record<string, any>): Promise
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
-app.use(rateLimit({ windowMs: RATE_WINDOW_MINUTES * 60 * 1000, max: RATE_LIMIT }));
+app.use(rateLimit({ windowMs: RATE_WINDOW_MINUTES * 60 * 1000, max: RATE_LIMIT_MAX }));
 
-// Auth middleware
+// Auth middleware — wallet tokens only
+// Users authenticate via `rickydata auth login` and connect via `rickydata mcp connect-server`
 const authMiddleware: express.RequestHandler = (req, res, next) => {
-  if (!REQUIRE_AUTH) return next();
-
   const authHeader = req.headers["authorization"] || "";
-  const apiKey = typeof authHeader === "string" ? authHeader.replace("Bearer ", "") : "";
+  const token = typeof authHeader === "string" ? authHeader.replace("Bearer ", "") : "";
 
-  if (!apiKey) {
-    res.status(401).json({ error: "Missing Authorization header" });
+  if (!token) {
+    res.status(401).json({ error: "Missing Authorization header. Run `rickydata auth login` then `rickydata mcp connect-server`." });
     return;
   }
 
-  if (apiKey.startsWith(WALLET_TOKEN_PREFIX)) {
-    const result = verifyWalletToken(apiKey);
-    if (!result) {
-      res.status(403).json({ error: "Invalid or expired wallet token. Get a new one at https://mcpmarketplace.rickydata.org/auth/cli" });
-      return;
-    }
-    (req as any).user = `wallet:${result.walletAddress}`;
-    return next();
-  }
-
-  const userName = USER_API_KEYS[apiKey];
-  if (!userName) {
-    res.status(403).json({ error: "Invalid API key" });
+  if (!token.startsWith(WALLET_TOKEN_PREFIX)) {
+    res.status(403).json({ error: "Invalid token format. Use a wallet token (mcpwt_). Run `rickydata auth login`." });
     return;
   }
-  (req as any).user = userName;
+
+  const result = verifyWalletToken(token);
+  if (!result) {
+    res.status(403).json({ error: "Invalid or expired wallet token. Run `rickydata auth login` to get a new one." });
+    return;
+  }
+
+  (req as any).user = `wallet:${result.walletAddress}`;
   next();
 };
 
@@ -649,7 +630,7 @@ app.get("/", (_req, res) => {
     version: "1.0.0",
     tools: TOOLS.length,
     endpoints: { health: "/health", mcp: "/mcp" },
-    authentication: REQUIRE_AUTH ? "enabled" : "disabled"
+    authentication: "wallet-token (mcpwt_)"
   });
 });
 
@@ -747,6 +728,6 @@ if (isStdio) {
     console.log(`rickydata MCP Server running on port ${port}`);
     console.log(`Tools: ${TOOLS.length}`);
     console.log(`Endpoints: /health /mcp`);
-    console.log(`Authentication: ${REQUIRE_AUTH ? "ENABLED" : "DISABLED"}`);
+    console.log(`Authentication: wallet-token (mcpwt_)`);
   });
 }
