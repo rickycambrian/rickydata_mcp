@@ -1,0 +1,85 @@
+name: Build and Deploy to Cloud Run
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  SERVICE_NAME: rickydata-mcp-server
+  REGION: us-central1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Authenticate with Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_DEPLOY_SA }}
+
+    - name: Set up Google Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+      with:
+        project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+    - name: Configure Docker
+      run: |
+        gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev
+
+    - name: Build and Push Docker image
+      run: |
+        IMAGE_URI="${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/mcp-servers/${{ env.SERVICE_NAME }}:${{ github.sha }}"
+        IMAGE_LATEST="${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/mcp-servers/${{ env.SERVICE_NAME }}:latest"
+        docker build -t "$IMAGE_URI" -t "$IMAGE_LATEST" .
+        docker push "$IMAGE_URI"
+        docker push "$IMAGE_LATEST"
+        echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+
+    - name: Deploy to Cloud Run
+      run: |
+        gcloud run deploy ${{ env.SERVICE_NAME }} \
+          --image "${{ env.IMAGE_URI }}" \
+          --platform managed \
+          --region ${{ env.REGION }} \
+          --port 8080 \
+          --memory 512Mi \
+          --cpu 1 \
+          --timeout 300 \
+          --max-instances 10 \
+          --min-instances 0 \
+          --project ${{ secrets.GCP_PROJECT_ID }} \
+          --service-account ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }} \
+          --set-env-vars "REQUIRE_AUTH=true" \
+          --set-env-vars "RATE_LIMIT=1000" \
+          --set-env-vars "RATE_WINDOW_MINUTES=10" \
+          --set-env-vars "RESPONSE_MAX_LENGTH=50000" \
+          --set-env-vars "CANVAS_API_URL=${{ secrets.CANVAS_API_URL }}" \
+          --set-env-vars "CANVAS_SERVICE_TOKEN=${{ secrets.CANVAS_SERVICE_TOKEN }}" \
+          --set-env-vars "AGENT_GATEWAY_URL=${{ secrets.AGENT_GATEWAY_URL }}" \
+          --set-env-vars "USER_RICKY_KEY=${{ secrets.USER_RICKY_KEY }}" \
+          --allow-unauthenticated
+
+    - name: Get Service URL
+      run: |
+        SERVICE_URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+          --platform managed \
+          --region ${{ env.REGION }} \
+          --project ${{ secrets.GCP_PROJECT_ID }} \
+          --format 'value(status.url)')
+        echo "Service deployed successfully!"
+        echo "Service URL: $SERVICE_URL"
+
+    - name: Test Deployment
+      run: |
+        sleep 10
+        curl -f "${{ env.SERVICE_URL }}/health" || echo "Health check not available yet"

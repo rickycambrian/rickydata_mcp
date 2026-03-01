@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+PREV_HOOKS_FILE="$REPO_ROOT/.githooks/.previous-hooks-path"
+
+if [ -f "$PREV_HOOKS_FILE" ]; then
+  PREV_HOOKS_PATH="$(cat "$PREV_HOOKS_FILE" 2>/dev/null || true)"
+  if [ -n "$PREV_HOOKS_PATH" ] && [ "$PREV_HOOKS_PATH" != ".githooks" ]; then
+    if [[ "$PREV_HOOKS_PATH" = /* ]]; then
+      PREV_HOOK="$PREV_HOOKS_PATH/pre-commit"
+    else
+      PREV_HOOK="$REPO_ROOT/$PREV_HOOKS_PATH/pre-commit"
+    fi
+
+    if [ -x "$PREV_HOOK" ]; then
+      "$PREV_HOOK"
+    fi
+  fi
+fi
+
+node "$REPO_ROOT/scripts/secret-guard.mjs" --staged
