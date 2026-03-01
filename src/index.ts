@@ -635,93 +635,83 @@ app.get("/", (_req, res) => {
   });
 });
 
-// MCP Server
-const server = new Server(
-  { name: "rickydata", version: "1.0.0" },
-  { capabilities: { tools: { listChanged: true } } }
-);
+// MCP Server factory — each stateless HTTP request gets its own server+transport
+function createMCPServer(): Server {
+  const s = new Server(
+    { name: "rickydata", version: "1.0.0" },
+    { capabilities: { tools: { listChanged: true } } }
+  );
 
-marketplaceManager.setServer(server);
+  s.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [...TOOLS, ...marketplaceManager.getDynamicTools()]
+  }));
 
-// List tools
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [...TOOLS, ...marketplaceManager.getDynamicTools()]
-}));
+  s.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args = {} } = request.params;
+    let result: any;
 
-// Call tool
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args = {} } = request.params;
-  let result: any;
-
-  try {
-    // Canvas tools
-    if (name.startsWith("canvas_") || name === "run_saved_canvas_workflow" || name === "run_workflow_and_wait" || name === "update_canvas_workflow" || name === "update_workflow_node") {
-      result = await handleCanvasTool(name, args);
+    try {
+      if (name.startsWith("canvas_") || name === "run_saved_canvas_workflow" || name === "run_workflow_and_wait" || name === "update_canvas_workflow" || name === "update_workflow_node") {
+        result = await handleCanvasTool(name, args);
+      } else if (name.startsWith("agent_")) {
+        result = await handleAgentTool(name, args);
+      } else if (name === "marketplace_search") {
+        result = await marketplaceManager.handleSearch(args as any);
+      } else if (name === "marketplace_server_info") {
+        result = await marketplaceManager.handleServerInfo(args as any);
+      } else if (name === "marketplace_enable_server") {
+        result = await marketplaceManager.handleEnableServer(args as any);
+      } else if (name === "marketplace_disable_server") {
+        result = await marketplaceManager.handleDisableServer(args as any);
+      } else if (name === "marketplace_list_enabled") {
+        result = await marketplaceManager.handleListEnabled();
+      } else if (marketplaceManager.isDynamicTool(name)) {
+        result = await marketplaceManager.handleDynamicToolCall(name, args);
+      } else {
+        result = { error: `Unknown tool: ${name}` };
+      }
+    } catch (error: any) {
+      result = { success: false, error: error.message };
     }
-    // Agent tools
-    else if (name.startsWith("agent_")) {
-      result = await handleAgentTool(name, args);
-    }
-    // Marketplace tools
-    else if (name === "marketplace_search") {
-      result = await marketplaceManager.handleSearch(args as any);
-    } else if (name === "marketplace_server_info") {
-      result = await marketplaceManager.handleServerInfo(args as any);
-    } else if (name === "marketplace_enable_server") {
-      result = await marketplaceManager.handleEnableServer(args as any);
-    } else if (name === "marketplace_disable_server") {
-      result = await marketplaceManager.handleDisableServer(args as any);
-    } else if (name === "marketplace_list_enabled") {
-      result = await marketplaceManager.handleListEnabled();
-    }
-    // Dynamic marketplace tools
-    else if (marketplaceManager.isDynamicTool(name)) {
-      result = await marketplaceManager.handleDynamicToolCall(name, args);
-    }
-    // Unknown
-    else {
-      result = { error: `Unknown tool: ${name}` };
-    }
-  } catch (error: any) {
-    result = { success: false, error: error.message };
-  }
 
-  const content = truncateResponse(result);
-  return {
-    content: [{ type: "text", text: typeof content === "string" ? content : JSON.stringify(content, null, 2) }]
-  };
-});
+    const content = truncateResponse(result);
+    return {
+      content: [{ type: "text", text: typeof content === "string" ? content : JSON.stringify(content, null, 2) }]
+    };
+  });
 
-// HTTP transport
-const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  return s;
+}
 
+// HTTP routes — stateless mode: new server+transport per request
 app.post("/mcp", authMiddleware, async (req, res) => {
-  // Extract user token and pass to marketplace manager
   const authHeader = req.headers["authorization"] || "";
   const userToken = typeof authHeader === "string" ? authHeader.replace("Bearer ", "") : "";
   marketplaceManager.setUserToken(userToken);
 
+  const server = createMCPServer();
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  res.on("close", () => { transport.close(); server.close(); });
+  await server.connect(transport);
   await transport.handleRequest(req, res, req.body);
 });
 
-app.get("/mcp", authMiddleware, async (req, res) => {
-  await transport.handleRequest(req, res);
+app.get("/mcp", (_req, res) => {
+  res.status(405).json({ error: "SSE not supported in stateless mode. Use POST." });
 });
 
-app.delete("/mcp", authMiddleware, async (req, res) => {
-  await transport.handleRequest(req, res);
+app.delete("/mcp", (_req, res) => {
+  res.status(405).json({ error: "Session deletion not supported in stateless mode." });
 });
-
-// Connect MCP server to transport
-await server.connect(transport);
 
 // Start
 const isStdio = process.argv.includes("--stdio");
 
 if (isStdio) {
   console.log = console.error;
+  const stdioServer = createMCPServer();
   const stdioTransport = new StdioServerTransport();
-  await server.connect(stdioTransport);
+  await stdioServer.connect(stdioTransport);
   console.error("rickydata MCP Server running on stdio");
 } else {
   const port = parseInt(process.env.PORT || "8080", 10);
