@@ -19,6 +19,7 @@ interface GatewayToolDefinition {
 interface EnabledServer {
   server_id: string;
   server_name: string;
+  gateway_prefix: string; // e.g. "io-github-brave-brave-search-mcp-server"
   tools: GatewayToolDefinition[];
   enabled_at: string;
 }
@@ -158,6 +159,36 @@ export class MarketplaceManager {
     }
   }
 
+  /** Fetch the full tools/list from the gateway and extract tools matching a server prefix. */
+  private async fetchGatewayToolsForServer(serverPrefix: string): Promise<GatewayToolDefinition[]> {
+    const token = this.currentUserToken;
+    const body = { jsonrpc: "2.0", id: Date.now(), method: "tools/list", params: {} };
+
+    const response = await fetch(GATEWAY_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        ...(token ? { "Authorization": `Bearer ${token}` } : {})
+      },
+      body: JSON.stringify(body)
+    });
+
+    if (!response.ok) return [];
+
+    const data = await response.json() as any;
+    const allTools: GatewayToolDefinition[] = data.result?.tools ?? [];
+
+    // Match tools whose name starts with the server prefix (e.g. "io-github-brave-brave-search-mcp-server__")
+    return allTools
+      .filter(t => t.name.startsWith(`${serverPrefix}__`))
+      .map(t => ({
+        name: t.name.substring(serverPrefix.length + 2), // strip prefix
+        description: t.description,
+        inputSchema: t.inputSchema
+      }));
+  }
+
   private async notifyToolsChanged(): Promise<void> {
     if (!this.server) return;
     try {
@@ -208,12 +239,17 @@ export class MarketplaceManager {
     }
 
     const gatewayResult = await this.callGateway("gateway__enable_server", { server_id: serverId });
-    const tools: GatewayToolDefinition[] = gatewayResult?.tools || [];
-    const serverName: string = gatewayResult?.server_name || gatewayResult?.name || serverId;
+    const serverName: string = gatewayResult?.server?.name || gatewayResult?.server_name || gatewayResult?.name || serverId;
+
+    // The gateway enable response doesn't include tool definitions —
+    // fetch them from gateway tools/list using the server name as prefix
+    const namePrefix = serverName.replace(/[/.]/g, "-");
+    const tools: GatewayToolDefinition[] = await this.fetchGatewayToolsForServer(namePrefix);
 
     this.enabledServers.set(serverId, {
       server_id: serverId,
       server_name: serverName,
+      gateway_prefix: namePrefix,
       tools,
       enabled_at: new Date().toISOString()
     });
@@ -292,7 +328,9 @@ export class MarketplaceManager {
       throw new Error(`Server "${serverId}" is not enabled. Enable it first with marketplace_enable_server.`);
     }
 
-    return await this.callGateway(`${serverId}__${originalToolName}`, args);
+    // Use the gateway prefix (server name) instead of the UUID
+    const serverInfo = this.enabledServers.get(serverId)!;
+    return await this.callGateway(`${serverInfo.gateway_prefix}__${originalToolName}`, args);
   }
 
   isDynamicTool(toolName: string): boolean {

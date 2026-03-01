@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -6,7 +7,7 @@ import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
 import { verifyWalletToken, WALLET_TOKEN_PREFIX } from "./wallet-token.js";
-import { marketplaceManager, MARKETPLACE_TOOLS } from "./marketplace.js";
+import { MarketplaceManager, MARKETPLACE_TOOLS } from "./marketplace.js";
 
 // ============================================================================
 // CONFIGURATION
@@ -271,8 +272,8 @@ const TOOLS = [...CANVAS_TOOLS, ...AGENT_TOOLS, ...MARKETPLACE_TOOLS];
 // CANVAS TOOL HANDLERS
 // ============================================================================
 
-async function handleCanvasTool(name: string, args: Record<string, any>): Promise<any> {
-  const token = marketplaceManager.getUserToken();
+async function handleCanvasTool(name: string, args: Record<string, any>, marketplace: MarketplaceManager): Promise<any> {
+  const token = marketplace.getUserToken();
   if (!token) throw new Error("No auth token. Authenticate with a wallet token first.");
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -486,8 +487,8 @@ async function handleCanvasTool(name: string, args: Record<string, any>): Promis
 // AGENT TOOL HANDLERS
 // ============================================================================
 
-async function handleAgentTool(name: string, args: Record<string, any>): Promise<any> {
-  const token = marketplaceManager.getUserToken();
+async function handleAgentTool(name: string, args: Record<string, any>, marketplace: MarketplaceManager): Promise<any> {
+  const token = marketplace.getUserToken();
 
   switch (name) {
     case "agent_list": {
@@ -637,38 +638,64 @@ app.get("/", (_req, res) => {
   });
 });
 
-// MCP Server factory — each stateless HTTP request gets its own server+transport
-function createMCPServer(): Server {
-  const s = new Server(
+// Session management — each MCP session gets its own server, transport, and marketplace state
+interface MCPSession {
+  server: Server;
+  transport: StreamableHTTPServerTransport;
+  marketplace: MarketplaceManager;
+  createdAt: number;
+}
+
+const sessions = new Map<string, MCPSession>();
+
+// Clean up sessions older than 2 hours
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of sessions) {
+    if (now - session.createdAt > 2 * 60 * 60 * 1000) {
+      session.transport.close();
+      session.server.close();
+      sessions.delete(id);
+    }
+  }
+}, 5 * 60 * 1000);
+
+function createMCPSession(userToken: string): MCPSession {
+  const marketplace = new MarketplaceManager();
+  marketplace.setUserToken(userToken);
+
+  const server = new Server(
     { name: "rickydata", version: "1.0.0" },
     { capabilities: { tools: { listChanged: true } } }
   );
 
-  s.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [...TOOLS, ...marketplaceManager.getDynamicTools()]
+  marketplace.setServer(server);
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [...TOOLS, ...marketplace.getDynamicTools()]
   }));
 
-  s.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args = {} } = request.params;
     let result: any;
 
     try {
       if (name.startsWith("canvas_") || name === "run_saved_canvas_workflow" || name === "run_workflow_and_wait" || name === "update_canvas_workflow" || name === "update_workflow_node") {
-        result = await handleCanvasTool(name, args);
+        result = await handleCanvasTool(name, args, marketplace);
       } else if (name.startsWith("agent_")) {
-        result = await handleAgentTool(name, args);
+        result = await handleAgentTool(name, args, marketplace);
       } else if (name === "marketplace_search") {
-        result = await marketplaceManager.handleSearch(args as any);
+        result = await marketplace.handleSearch(args as any);
       } else if (name === "marketplace_server_info") {
-        result = await marketplaceManager.handleServerInfo(args as any);
+        result = await marketplace.handleServerInfo(args as any);
       } else if (name === "marketplace_enable_server") {
-        result = await marketplaceManager.handleEnableServer(args as any);
+        result = await marketplace.handleEnableServer(args as any);
       } else if (name === "marketplace_disable_server") {
-        result = await marketplaceManager.handleDisableServer(args as any);
+        result = await marketplace.handleDisableServer(args as any);
       } else if (name === "marketplace_list_enabled") {
-        result = await marketplaceManager.handleListEnabled();
-      } else if (marketplaceManager.isDynamicTool(name)) {
-        result = await marketplaceManager.handleDynamicToolCall(name, args);
+        result = await marketplace.handleListEnabled();
+      } else if (marketplace.isDynamicTool(name)) {
+        result = await marketplace.handleDynamicToolCall(name, args);
       } else {
         result = { error: `Unknown tool: ${name}` };
       }
@@ -682,28 +709,53 @@ function createMCPServer(): Server {
     };
   });
 
-  return s;
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID() });
+
+  return { server, transport, marketplace, createdAt: Date.now() };
 }
 
-// HTTP routes — stateless mode: new server+transport per request
+// HTTP routes — session-based: state persists across requests
 app.post("/mcp", authMiddleware, async (req, res) => {
   const authHeader = req.headers["authorization"] || "";
   const userToken = typeof authHeader === "string" ? authHeader.replace("Bearer ", "") : "";
-  marketplaceManager.setUserToken(userToken);
 
-  const server = createMCPServer();
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-  res.on("close", () => { transport.close(); server.close(); });
-  await server.connect(transport);
-  await transport.handleRequest(req, res, req.body);
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+  let session: MCPSession;
+
+  if (sessionId && sessions.has(sessionId)) {
+    session = sessions.get(sessionId)!;
+    session.marketplace.setUserToken(userToken);
+  } else {
+    session = createMCPSession(userToken);
+    await session.server.connect(session.transport);
+    // Store session after connect so the transport has assigned its ID
+    const newId = (session.transport as any).sessionId;
+    if (newId) sessions.set(newId, session);
+  }
+
+  await session.transport.handleRequest(req, res, req.body);
 });
 
-app.get("/mcp", (_req, res) => {
-  res.status(405).json({ error: "SSE not supported in stateless mode. Use POST." });
+app.get("/mcp", authMiddleware, async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+  if (!sessionId || !sessions.has(sessionId)) {
+    res.status(400).json({ error: "Invalid or missing session. Send initialize first via POST." });
+    return;
+  }
+  await sessions.get(sessionId)!.transport.handleRequest(req, res);
 });
 
-app.delete("/mcp", (_req, res) => {
-  res.status(405).json({ error: "Session deletion not supported in stateless mode." });
+app.delete("/mcp", authMiddleware, async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+  if (sessionId && sessions.has(sessionId)) {
+    const session = sessions.get(sessionId)!;
+    await session.transport.handleRequest(req, res);
+    session.transport.close();
+    session.server.close();
+    sessions.delete(sessionId);
+  } else {
+    res.status(400).json({ error: "Invalid or missing session." });
+  }
 });
 
 // Start
@@ -711,7 +763,46 @@ const isStdio = process.argv.includes("--stdio");
 
 if (isStdio) {
   console.log = console.error;
-  const stdioServer = createMCPServer();
+  const stdioMarketplace = new MarketplaceManager();
+  const stdioServer = new Server(
+    { name: "rickydata", version: "1.0.0" },
+    { capabilities: { tools: { listChanged: true } } }
+  );
+  stdioMarketplace.setServer(stdioServer);
+  stdioServer.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [...TOOLS, ...stdioMarketplace.getDynamicTools()]
+  }));
+  stdioServer.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args = {} } = request.params;
+    let result: any;
+    try {
+      if (name.startsWith("canvas_") || name === "run_saved_canvas_workflow" || name === "run_workflow_and_wait" || name === "update_canvas_workflow" || name === "update_workflow_node") {
+        result = await handleCanvasTool(name, args, stdioMarketplace);
+      } else if (name.startsWith("agent_")) {
+        result = await handleAgentTool(name, args, stdioMarketplace);
+      } else if (name === "marketplace_search") {
+        result = await stdioMarketplace.handleSearch(args as any);
+      } else if (name === "marketplace_server_info") {
+        result = await stdioMarketplace.handleServerInfo(args as any);
+      } else if (name === "marketplace_enable_server") {
+        result = await stdioMarketplace.handleEnableServer(args as any);
+      } else if (name === "marketplace_disable_server") {
+        result = await stdioMarketplace.handleDisableServer(args as any);
+      } else if (name === "marketplace_list_enabled") {
+        result = await stdioMarketplace.handleListEnabled();
+      } else if (stdioMarketplace.isDynamicTool(name)) {
+        result = await stdioMarketplace.handleDynamicToolCall(name, args);
+      } else {
+        result = { error: `Unknown tool: ${name}` };
+      }
+    } catch (error: any) {
+      result = { success: false, error: error.message };
+    }
+    const content = truncateResponse(result);
+    return {
+      content: [{ type: "text", text: typeof content === "string" ? content : JSON.stringify(content, null, 2) }]
+    };
+  });
   const stdioTransport = new StdioServerTransport();
   await stdioServer.connect(stdioTransport);
   console.error("rickydata MCP Server running on stdio");
