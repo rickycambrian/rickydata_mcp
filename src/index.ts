@@ -588,9 +588,10 @@ async function handleAgentTool(name: string, args: Record<string, any>): Promise
 // ============================================================================
 
 const app = express();
+app.set("trust proxy", 1);
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
-app.use(rateLimit({ windowMs: RATE_WINDOW_MINUTES * 60 * 1000, max: RATE_LIMIT_MAX }));
+app.use(rateLimit({ windowMs: RATE_WINDOW_MINUTES * 60 * 1000, max: RATE_LIMIT_MAX, validate: { xForwardedForHeader: false } }));
 
 // Auth middleware — wallet tokens only
 // Users authenticate via `rickydata auth login` and connect via `rickydata mcp connect-server`
