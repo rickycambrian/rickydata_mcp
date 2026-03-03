@@ -464,7 +464,14 @@ async function handleAgentTool(name: string, args: Record<string, any>, marketpl
           }
           if (event.type === "done" && event.data?.cost) cost = event.data.cost;
           if (event.type === "usage" && event.data?.cost) cost = event.data.cost;
-        } catch { /* skip malformed SSE lines */ }
+          if (event.type === "error") {
+            const errMsg = event.data?.message || JSON.stringify(event.data);
+            throw new Error(`Agent error: ${errMsg}`);
+          }
+        } catch (e) {
+          if (e instanceof Error && e.message.startsWith("Agent error:")) throw e;
+          /* skip malformed SSE lines */
+        }
       }
 
       return {
