@@ -18,6 +18,62 @@ const CANVAS_API_URL = process.env.CANVAS_API_URL || "https://agents.rickydata.o
 const AGENT_GATEWAY_URL = process.env.AGENT_GATEWAY_URL || "https://agents.rickydata.org";
 
 // ============================================================================
+// NODE TYPE CATALOG (static reference for canvas_get_available_tools)
+// ============================================================================
+
+const NODE_TYPE_CATALOG = [
+  { type: "text-input", name: "Text Input", category: "inputs", description: "Provides text input to the workflow. Used as the starting point for user prompts or static text.", configFields: ["label", "value", "placeholder"] },
+  { type: "agent", name: "Agent", category: "agents", description: "An AI agent node that processes input using a configurable model and prompt. Can use MCP tools.", configFields: ["label", "sourceType", "sourceAgentId", "model", "prompt", "maxTurns", "allowedTools", "allowedServers"] },
+  { type: "mcp-tool", name: "MCP Tool", category: "tools", description: "Calls a specific MCP tool from an enabled marketplace server with configured parameters.", configFields: ["label", "toolName", "serverName", "serverId", "parameters", "inputSchema"] },
+  { type: "results", name: "Results", category: "output", description: "Displays the final output of the workflow. Collects results from upstream nodes.", configFields: ["label"] },
+  { type: "agent-team-orchestrator", name: "Agent Team Orchestrator", category: "agents", description: "Orchestrates a team of agent teammates. Coordinates multi-agent workflows with a shared objective.", configFields: ["label", "teamName", "prompt", "model", "executionMode", "continueEnabled", "allowedServers"] },
+  { type: "agent-team-teammate", name: "Agent Team Teammate", category: "agents", description: "A teammate agent within an orchestrated team. Has a specific role and capabilities.", configFields: ["label", "teammateName", "sourceType", "sourceAgentId", "rolePrompt", "model", "allowedServers"] },
+  { type: "approval-gate", name: "Approval Gate", category: "control", description: "Pauses workflow execution until human approval is granted or rejected.", configFields: ["label", "message"] },
+  { type: "github-repo", name: "GitHub Repository", category: "github", description: "Connects to a GitHub repository. Provides repo context for downstream GitHub nodes.", configFields: ["label", "owner", "repo", "branch", "installationId"] },
+  { type: "github-create-branch", name: "GitHub Create Branch", category: "github", description: "Creates a new branch in the connected GitHub repository.", configFields: ["label", "branchName", "baseBranch"] },
+  { type: "github-create-issue", name: "GitHub Create Issue", category: "github", description: "Creates an issue in the connected GitHub repository.", configFields: ["label", "title", "body", "labels", "assignees"] },
+  { type: "github-commit-files", name: "GitHub Commit Files", category: "github", description: "Commits files to a branch in the connected GitHub repository.", configFields: ["label", "branch", "message", "filesJson", "consumeUpstream"] },
+  { type: "github-open-draft-pr", name: "GitHub Open Draft PR", category: "github", description: "Opens a draft pull request in the connected GitHub repository.", configFields: ["label", "head", "base", "title", "body", "consumeUpstream"] },
+  { type: "github-mark-pr-ready", name: "GitHub Mark PR Ready", category: "github", description: "Marks a draft pull request as ready for review.", configFields: ["label", "prNumber", "ciPolicy"] },
+  { type: "browser-verify", name: "Browser Verify", category: "browser", description: "Runs browser-based verification steps and assertions against a URL.", configFields: ["label", "serverId", "sessionConfigJson", "stepsJson", "assertionsJson", "timeoutMs"] },
+];
+
+// ============================================================================
+// CANVAS AI SYSTEM PROMPT
+// ============================================================================
+
+const CANVAS_AI_SYSTEM_PROMPT = `You are a canvas workflow assistant. You help users build and modify visual workflows.
+
+Available node types:
+${NODE_TYPE_CATALOG.map(n => `- ${n.type} (${n.category}): ${n.description}`).join("\n")}
+
+When the user asks to create or modify a workflow, respond with a JSON action block inside <action> tags.
+
+Action formats:
+
+1. Create a new workflow:
+<action>
+{"action": "create_workflow", "message": "Description of what was created", "data": {"name": "workflow name", "description": "workflow description", "nodes": [{"id": "node_1", "type": "text-input", "position": {"x": 0, "y": 0}, "data": {"label": "Input", "value": ""}}], "connections": [{"source": "node_1", "target": "node_2"}]}}
+</action>
+
+2. Add a node to an existing workflow:
+<action>
+{"action": "add_node", "message": "Added an agent node", "data": {"node": {"id": "node_3", "type": "agent", "position": {"x": 300, "y": 0}, "data": {"label": "My Agent", "model": "sonnet"}}, "connections": [{"source": "node_2", "target": "node_3"}]}}
+</action>
+
+3. Connect two nodes:
+<action>
+{"action": "connect", "message": "Connected nodes", "data": {"connections": [{"source": "node_1", "target": "node_2"}]}}
+</action>
+
+4. Update a node's configuration:
+<action>
+{"action": "update_node", "message": "Updated node prompt", "data": {"node_id": "node_2", "updates": {"prompt": "Analyze the input text"}}}
+</action>
+
+Always include a human-readable "message" explaining what you did. Position nodes with reasonable spacing (200-300px apart).`;
+
+// ============================================================================
 // HELPERS
 // ============================================================================
 
@@ -141,6 +197,82 @@ const CANVAS_TOOLS = [
         max_wait_seconds: { type: "number", description: "Max wait time (default: 300, max: 600)" },
         poll_interval_seconds: { type: "number", description: "Poll interval (default: 5)" }
       }
+    }
+  },
+  {
+    name: "canvas_get_available_tools",
+    description: "Get available canvas node types and MCP tools for building workflows. Returns a catalog of all node types (agent, text-input, mcp-tool, github nodes, etc.) and optionally enabled MCP tools.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        category: { type: "string", description: "Filter by category: inputs, agents, tools, output, control, github, browser" }
+      }
+    }
+  },
+  {
+    name: "canvas_get_workflow_messages",
+    description: "Get per-node messages and results from a workflow run. Shows status, results, approvals, and logs for each node.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        run_id: { type: "string", description: "Run ID to get messages for" },
+        node_id: { type: "string", description: "Optional: filter to a single node's data" }
+      },
+      required: ["run_id"]
+    }
+  },
+  {
+    name: "canvas_ai_assistant",
+    description: "AI assistant for canvas workflows. Provide a natural language request and optionally the current canvas state to get structured workflow actions (create_workflow, add_node, connect, update_node).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        message: { type: "string", description: "Natural language request (e.g., 'Create a workflow with text input and agent')" },
+        canvas_state: { type: "object", description: "Optional current canvas state with nodes and connections" }
+      },
+      required: ["message"]
+    }
+  },
+  {
+    name: "canvas_ai_assistant_voice",
+    description: "Voice variant of the canvas AI assistant. Takes a voice transcription instead of text message.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        transcription: { type: "string", description: "Voice transcription text" },
+        canvas_state: { type: "object", description: "Optional current canvas state with nodes and connections" }
+      },
+      required: ["transcription"]
+    }
+  },
+  {
+    name: "update_canvas_workflow",
+    description: "Update a saved canvas workflow. Fetches the existing workflow, merges your changes, and saves as a new version (Geo storage is immutable).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workflow_id: { type: "string", description: "Workflow entityId to update" },
+        name: { type: "string", description: "New workflow name" },
+        description: { type: "string", description: "New workflow description" },
+        nodes: { type: "array", description: "Updated nodes array (replaces existing)" },
+        connections: { type: "array", description: "Updated connections array (replaces existing)" }
+      },
+      required: ["workflow_id"]
+    }
+  },
+  {
+    name: "update_workflow_node",
+    description: "Update a single node within a saved workflow. Modifies the node's data/type/position and saves as a new version.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workflow_id: { type: "string", description: "Workflow entityId containing the node" },
+        node_id: { type: "string", description: "ID of the node to update" },
+        type: { type: "string", description: "Optional new node type" },
+        position: { type: "object", description: "Optional new position {x, y}" },
+        data: { type: "object", description: "Data fields to merge into the node's existing data" }
+      },
+      required: ["workflow_id", "node_id"]
     }
   },
 ];
@@ -371,6 +503,230 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       return { ...result, elapsed_seconds: Math.round((Date.now() - start) / 1000) };
     }
 
+    case "canvas_get_available_tools": {
+      // Static catalog of node types + dynamic MCP tools from marketplace
+      let catalog = [...NODE_TYPE_CATALOG];
+      if (args.category) {
+        catalog = catalog.filter(n => n.category === args.category);
+      }
+
+      // Append enabled MCP tools as mcp-tool entries
+      const enabledResult = await marketplace.handleListEnabled();
+      const mcpToolEntries: typeof NODE_TYPE_CATALOG = [];
+      for (const server of enabledResult.enabled_servers || []) {
+        for (const tool of server.tools || []) {
+          mcpToolEntries.push({
+            type: "mcp-tool",
+            name: tool.name,
+            category: "tools",
+            description: `[${server.server_name}] ${tool.description || ""}`,
+            configFields: ["toolName", "serverName", "serverId", "parameters"]
+          });
+        }
+      }
+
+      if (!args.category || args.category === "tools") {
+        catalog = [...catalog, ...mcpToolEntries];
+      }
+
+      return { node_types: catalog, count: catalog.length, mcp_tools_count: mcpToolEntries.length };
+    }
+
+    case "canvas_get_workflow_messages": {
+      // Fetch run details and transform into per-node messages
+      const response = await fetchWithTimeout(
+        `${CANVAS_API_URL}/canvas/runs/${encodeURIComponent(args.run_id)}`,
+        { headers },
+        15000
+      );
+      if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
+      const run = await response.json() as any;
+
+      const nodeStatuses: Record<string, string> = run.nodeStatuses || {};
+      const nodeResults: Record<string, any> = run.nodeResults || {};
+      const approvals: any[] = run.approvals || [];
+      const logs: string[] = run.logs || [];
+
+      let messages: any[] = [];
+      for (const [nodeId, status] of Object.entries(nodeStatuses)) {
+        messages.push({ nodeId, status, result: nodeResults[nodeId] || null });
+      }
+
+      // Filter to single node if requested
+      if (args.node_id) {
+        messages = messages.filter(m => m.nodeId === args.node_id);
+      }
+
+      return {
+        run_id: run.runId || args.run_id,
+        status: run.status,
+        messages,
+        approvals: args.node_id ? approvals.filter((a: any) => a.nodeId === args.node_id) : approvals,
+        logs,
+        error: run.error
+      };
+    }
+
+    case "canvas_ai_assistant":
+    case "canvas_ai_assistant_voice": {
+      // Use agent chat endpoint with a structured prompt
+      const userMessage = name === "canvas_ai_assistant_voice" ? args.transcription : args.message;
+      if (!userMessage) throw new Error("Message or transcription is required");
+
+      // Find a suitable agent
+      const agentsResponse = await fetchWithTimeout(
+        `${AGENT_GATEWAY_URL}/agents`,
+        { headers: { "Content-Type": "application/json" } },
+        15000
+      );
+      if (!agentsResponse.ok) throw new Error(`Failed to list agents: ${agentsResponse.status}`);
+      const agentsData = await agentsResponse.json() as any;
+      const agents = agentsData.agents || [];
+      const agent = agents.find((a: any) => !a.requiredSecrets?.length) || agents[0];
+      if (!agent) throw new Error("No agents available for AI assistant");
+
+      // Build the prompt
+      let prompt = CANVAS_AI_SYSTEM_PROMPT + "\n\n";
+      if (args.canvas_state) {
+        prompt += `Current canvas state:\n${JSON.stringify(args.canvas_state, null, 2)}\n\n`;
+      }
+      prompt += `User request: ${userMessage}`;
+
+      // Create session and chat
+      const sessionResponse = await fetchWithTimeout(
+        `${AGENT_GATEWAY_URL}/agents/${encodeURIComponent(agent.id)}/sessions`,
+        { method: "POST", headers, body: JSON.stringify({ model: "sonnet" }) },
+        15000
+      );
+      if (!sessionResponse.ok) throw new Error(`Failed to create session: ${sessionResponse.status}`);
+      const sessionData = await sessionResponse.json() as any;
+
+      const chatResponse = await fetchWithTimeout(
+        `${AGENT_GATEWAY_URL}/agents/${encodeURIComponent(agent.id)}/sessions/${encodeURIComponent(sessionData.id)}/chat`,
+        { method: "POST", headers: { ...headers, "Accept": "text/event-stream" }, body: JSON.stringify({ message: prompt, model: "sonnet" }) },
+        120000
+      );
+      if (!chatResponse.ok) throw new Error(`Chat failed: ${chatResponse.status} ${await chatResponse.text()}`);
+
+      // Parse SSE response
+      const responseText = await chatResponse.text();
+      let accumulatedText = "";
+      for (const line of responseText.split("\n")) {
+        const dataStr = line.startsWith("data: ") ? line.slice(6) : line.startsWith("data:") ? line.slice(5) : null;
+        if (!dataStr || dataStr === "[DONE]") continue;
+        try {
+          const event = JSON.parse(dataStr) as any;
+          if (event.type === "text") {
+            if (typeof event.data === "string") accumulatedText += event.data;
+            else if (event.data?.text) accumulatedText += event.data.text;
+          }
+          if (event.type === "content_block_delta" && event.delta?.text) accumulatedText += event.delta.text;
+        } catch { /* skip */ }
+      }
+
+      // Extract action from <action> tags
+      const actionMatch = accumulatedText.match(/<action>\s*([\s\S]*?)\s*<\/action>/);
+      let action: any = null;
+      if (actionMatch) {
+        try { action = JSON.parse(actionMatch[1]); } catch { /* keep null */ }
+      }
+
+      return {
+        response: accumulatedText,
+        action,
+        agent_used: agent.id,
+        message: action ? `AI suggested action: ${action.action}` : "AI responded without a structured action"
+      };
+    }
+
+    case "update_canvas_workflow": {
+      // Fetch → merge → save as new version
+      const wfResponse = await fetchWithTimeout(
+        `${CANVAS_API_URL}/canvas/workflows`,
+        { headers },
+        15000
+      );
+      if (!wfResponse.ok) throw new Error(`Failed to load workflows: ${await wfResponse.text()}`);
+      const wfData = await wfResponse.json() as any;
+      const workflows = wfData.workflows || [];
+      const wf = workflows.find((w: any) => w.entityId === args.workflow_id || w.name === args.workflow_id);
+      if (!wf) throw new Error(`Workflow "${args.workflow_id}" not found`);
+
+      const existingNodes = typeof wf.nodesJson === "string" ? JSON.parse(wf.nodesJson) : (wf.nodes || []);
+      const existingEdges = typeof wf.edgesJson === "string" ? JSON.parse(wf.edgesJson) : (wf.edges || []);
+
+      const savePayload: Record<string, any> = {
+        name: args.name || wf.name,
+        description: args.description !== undefined ? args.description : (wf.description || ""),
+        nodes: args.nodes || existingNodes,
+        connections: args.connections || existingEdges.map((e: any) => ({ source: e.source, target: e.target }))
+      };
+
+      const saveResponse = await fetchWithTimeout(
+        `${CANVAS_API_URL}/canvas/workflows`,
+        { method: "POST", headers, body: JSON.stringify(savePayload) },
+        15000
+      );
+      if (!saveResponse.ok) throw new Error(`Failed to save workflow: ${await saveResponse.text()}`);
+      const saved = await saveResponse.json() as any;
+
+      return {
+        success: true,
+        previous_id: args.workflow_id,
+        new_entity_id: saved.entityId || saved.id,
+        name: savePayload.name,
+        message: "Saved as new version (Geo storage is immutable). Use the new entityId for future references."
+      };
+    }
+
+    case "update_workflow_node": {
+      // Fetch → modify single node → save as new version
+      const wfResponse = await fetchWithTimeout(
+        `${CANVAS_API_URL}/canvas/workflows`,
+        { headers },
+        15000
+      );
+      if (!wfResponse.ok) throw new Error(`Failed to load workflows: ${await wfResponse.text()}`);
+      const wfData = await wfResponse.json() as any;
+      const workflows = wfData.workflows || [];
+      const wf = workflows.find((w: any) => w.entityId === args.workflow_id || w.name === args.workflow_id);
+      if (!wf) throw new Error(`Workflow "${args.workflow_id}" not found`);
+
+      const nodes = typeof wf.nodesJson === "string" ? JSON.parse(wf.nodesJson) : (wf.nodes || []);
+      const edges = typeof wf.edgesJson === "string" ? JSON.parse(wf.edgesJson) : (wf.edges || []);
+
+      const targetNode = nodes.find((n: any) => n.id === args.node_id);
+      if (!targetNode) throw new Error(`Node "${args.node_id}" not found in workflow "${args.workflow_id}"`);
+
+      // Apply updates
+      if (args.type) targetNode.type = args.type;
+      if (args.position) targetNode.position = args.position;
+      if (args.data) targetNode.data = { ...targetNode.data, ...args.data };
+
+      const savePayload = {
+        name: wf.name,
+        description: wf.description || "",
+        nodes,
+        connections: edges.map((e: any) => ({ source: e.source, target: e.target }))
+      };
+
+      const saveResponse = await fetchWithTimeout(
+        `${CANVAS_API_URL}/canvas/workflows`,
+        { method: "POST", headers, body: JSON.stringify(savePayload) },
+        15000
+      );
+      if (!saveResponse.ok) throw new Error(`Failed to save workflow: ${await saveResponse.text()}`);
+      const saved = await saveResponse.json() as any;
+
+      return {
+        success: true,
+        previous_id: args.workflow_id,
+        new_entity_id: saved.entityId || saved.id,
+        updated_node_id: args.node_id,
+        message: "Node updated and saved as new version (Geo storage is immutable)."
+      };
+    }
+
     default:
       throw new Error(`Unknown canvas tool: ${name}`);
   }
@@ -577,7 +933,7 @@ function setupMCPHandlers(server: Server, marketplace: MarketplaceManager): void
     let result: any;
 
     try {
-      if (name.startsWith("canvas_") || name === "run_saved_canvas_workflow" || name === "run_workflow_and_wait") {
+      if (name.startsWith("canvas_") || name.startsWith("update_canvas_") || name.startsWith("update_workflow_") || name === "run_saved_canvas_workflow" || name === "run_workflow_and_wait") {
         result = await handleCanvasTool(name, args, marketplace);
       } else if (name.startsWith("agent_")) {
         result = await handleAgentTool(name, args, marketplace);
@@ -679,7 +1035,7 @@ if (isStdio) {
     const { name, arguments: args = {} } = request.params;
     let result: any;
     try {
-      if (name.startsWith("canvas_") || name === "run_saved_canvas_workflow" || name === "run_workflow_and_wait") {
+      if (name.startsWith("canvas_") || name.startsWith("update_canvas_") || name.startsWith("update_workflow_") || name === "run_saved_canvas_workflow" || name === "run_workflow_and_wait") {
         result = await handleCanvasTool(name, args, stdioMarketplace);
       } else if (name.startsWith("agent_")) {
         result = await handleAgentTool(name, args, stdioMarketplace);
