@@ -44,16 +44,6 @@ function truncateResponse(data: any): any {
 
 const CANVAS_TOOLS = [
   {
-    name: "canvas_get_available_tools",
-    description: "Get all available tools for canvas workflow building.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        category: { type: "string", description: "Filter by category" }
-      }
-    }
-  },
-  {
     name: "canvas_execute_workflow",
     description: "Execute a canvas workflow synchronously. Pass nodes and connections, get results back.",
     inputSchema: {
@@ -89,20 +79,6 @@ const CANVAS_TOOLS = [
         runId: { type: "string", description: "Run ID from canvas_execute_workflow_async" }
       },
       required: ["runId"]
-    }
-  },
-  {
-    name: "canvas_get_workflow_messages",
-    description: "Get detailed messages from a workflow run for debugging or live visibility.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        run_id: { type: "string", description: "Workflow run ID" },
-        after_index: { type: "number", description: "Only return messages after this index" },
-        node_id: { type: "string", description: "Filter to specific node" },
-        limit: { type: "number", description: "Max messages (default: 100)" }
-      },
-      required: ["run_id"]
     }
   },
   {
@@ -167,67 +143,6 @@ const CANVAS_TOOLS = [
       }
     }
   },
-  {
-    name: "update_canvas_workflow",
-    description: "Update an existing workflow by ID.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        workflow_id: { type: "string", description: "Workflow UUID to update" },
-        name: { type: "string", description: "New name" },
-        description: { type: "string", description: "New description" },
-        nodes: { type: "array", description: "New nodes" },
-        connections: { type: "array", description: "New connections" }
-      },
-      required: ["workflow_id"]
-    }
-  },
-  {
-    name: "update_workflow_node",
-    description: "Update a specific node in a workflow without rewriting the entire thing.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        workflow_id: { type: "string", description: "Workflow UUID" },
-        node_id: { type: "string", description: "Node ID to update" },
-        config_updates: { type: "object", description: "Partial config updates to merge" },
-        name: { type: "string", description: "New node name" }
-      },
-      required: ["workflow_id", "node_id"]
-    }
-  },
-  {
-    name: "canvas_ai_assistant",
-    description: "Use AI to build workflows from natural language.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        message: { type: "string", description: "Natural language instruction" },
-        currentWorkflow: {
-          type: "object",
-          description: "Current workflow state",
-          properties: { nodes: { type: "array" }, connections: { type: "array" } }
-        }
-      },
-      required: ["message"]
-    }
-  },
-  {
-    name: "canvas_ai_assistant_voice",
-    description: "Voice-optimized Canvas AI Assistant for smartwatch/mobile.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        transcription: { type: "string", description: "Transcribed voice input" },
-        currentWorkflow: {
-          type: "object",
-          properties: { nodes: { type: "array" }, connections: { type: "array" } }
-        },
-        sessionId: { type: "string", description: "Session ID for context tracking" }
-      },
-      required: ["transcription"]
-    }
-  }
 ];
 
 const AGENT_TOOLS = [
@@ -311,20 +226,6 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
   };
 
   switch (name) {
-    case "canvas_get_available_tools": {
-      const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/canvas/available-tools`,
-        { headers },
-        15000
-      );
-      if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
-      const data = await response.json() as any;
-      if (args.category && data.tools) {
-        data.tools = data.tools.filter((t: any) => t.category === args.category || t.category?.startsWith(args.category));
-      }
-      return data;
-    }
-
     case "canvas_execute_workflow": {
       // Synchronous execution via SSE streaming — collect all events and return final result
       const response = await fetchWithTimeout(
@@ -353,20 +254,6 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
     case "canvas_get_workflow_run": {
       const response = await fetchWithTimeout(
         `${CANVAS_API_URL}/canvas/runs/${args.runId}`,
-        { headers },
-        15000
-      );
-      if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
-      return await response.json();
-    }
-
-    case "canvas_get_workflow_messages": {
-      const params = new URLSearchParams();
-      if (args.after_index) params.append("after_index", String(args.after_index));
-      if (args.node_id) params.append("node_id", args.node_id);
-      if (args.limit) params.append("limit", String(args.limit));
-      const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/canvas/runs/${args.run_id}/messages?${params}`,
         { headers },
         15000
       );
@@ -420,14 +307,19 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       if (!wfResponse.ok) throw new Error(`Failed to load workflows: ${await wfResponse.text()}`);
       const wfData = await wfResponse.json() as any;
       const workflows = wfData.workflows || [];
-      const wf = workflows.find((w: any) => w.entityId === args.workflow_id || w.name === args.workflow_id);
-      if (!wf) throw new Error(`Workflow "${args.workflow_id}" not found`);
+      const wf = workflows.find((w: any) =>
+        (args.workflow_id && (w.entityId === args.workflow_id || w.name === args.workflow_id)) ||
+        (args.workflow_name && w.name === args.workflow_name)
+      );
+      const searchTerm = args.workflow_id || args.workflow_name || "unknown";
+      if (!wf) throw new Error(`Workflow "${searchTerm}" not found`);
 
-      const nodes = typeof wf.nodesJson === "string" ? JSON.parse(wf.nodesJson) : wf.nodes;
-      const edges = typeof wf.edgesJson === "string" ? JSON.parse(wf.edgesJson) : wf.edges;
+      const nodes = typeof wf.nodesJson === "string" ? JSON.parse(wf.nodesJson) : (wf.nodes || []);
+      const edges = typeof wf.edgesJson === "string" ? JSON.parse(wf.edgesJson) : (wf.edges || []);
+      if (!Array.isArray(nodes) || nodes.length === 0) throw new Error(`Workflow "${searchTerm}" has no nodes`);
       const request: Record<string, any> = {
         nodes: nodes.map((n: any) => ({ id: n.id, type: n.type, data: n.data })),
-        connections: edges.map((e: any) => ({ source: e.source, target: e.target })),
+        connections: (Array.isArray(edges) ? edges : []).map((e: any) => ({ source: e.source, target: e.target })),
         ...(args.inputs ? { inputs: args.inputs } : {})
       };
 
@@ -451,14 +343,19 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       if (!wfResponse.ok) throw new Error(`Failed to load workflows: ${await wfResponse.text()}`);
       const wfData = await wfResponse.json() as any;
       const workflows = wfData.workflows || [];
-      const wf = workflows.find((w: any) => w.entityId === args.workflow_id || w.name === args.workflow_id);
-      if (!wf) throw new Error(`Workflow "${args.workflow_id}" not found`);
+      const wf = workflows.find((w: any) =>
+        (args.workflow_id && (w.entityId === args.workflow_id || w.name === args.workflow_id)) ||
+        (args.workflow_name && w.name === args.workflow_name)
+      );
+      const searchTerm = args.workflow_id || args.workflow_name || "unknown";
+      if (!wf) throw new Error(`Workflow "${searchTerm}" not found`);
 
-      const nodes = typeof wf.nodesJson === "string" ? JSON.parse(wf.nodesJson) : wf.nodes;
-      const edges = typeof wf.edgesJson === "string" ? JSON.parse(wf.edgesJson) : wf.edges;
+      const nodes = typeof wf.nodesJson === "string" ? JSON.parse(wf.nodesJson) : (wf.nodes || []);
+      const edges = typeof wf.edgesJson === "string" ? JSON.parse(wf.edgesJson) : (wf.edges || []);
+      if (!Array.isArray(nodes) || nodes.length === 0) throw new Error(`Workflow "${searchTerm}" has no nodes`);
       const request: Record<string, any> = {
         nodes: nodes.map((n: any) => ({ id: n.id, type: n.type, data: n.data })),
-        connections: edges.map((e: any) => ({ source: e.source, target: e.target })),
+        connections: (Array.isArray(edges) ? edges : []).map((e: any) => ({ source: e.source, target: e.target })),
         ...(args.inputs ? { inputs: args.inputs } : {})
       };
 
@@ -472,65 +369,6 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       const sseText = await response.text();
       const result = parseSSEResult(sseText);
       return { ...result, elapsed_seconds: Math.round((Date.now() - start) / 1000) };
-    }
-
-    case "update_canvas_workflow": {
-      const { workflow_id, ...updates } = args;
-      const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/canvas/workflows/${workflow_id}`,
-        { method: "PUT", headers, body: JSON.stringify(updates) },
-        15000
-      );
-      if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
-      return await response.json();
-    }
-
-    case "update_workflow_node": {
-      const { workflow_id, node_id, config_updates, name: nodeName } = args;
-      const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/canvas/workflows/${workflow_id}/nodes/${node_id}`,
-        { method: "PATCH", headers, body: JSON.stringify({ config_updates, name: nodeName }) },
-        15000
-      );
-      if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
-      return await response.json();
-    }
-
-    case "canvas_ai_assistant": {
-      const toolsResponse = await fetch(`${CANVAS_API_URL}/canvas/available-tools`, { headers });
-      const availableTools = toolsResponse.ok ? await toolsResponse.json() : null;
-      const response = await fetch(`${CANVAS_API_URL}/canvas/ai-assistant`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          prompt: args.message,
-          canvasState: args.currentWorkflow || { nodes: [], connections: [] },
-          availableTools
-        })
-      });
-      if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
-      return await response.json();
-    }
-
-    case "canvas_ai_assistant_voice": {
-      const toolsResponse = await fetch(`${CANVAS_API_URL}/canvas/available-tools`, { headers });
-      const availableTools = toolsResponse.ok ? await toolsResponse.json() : null;
-      const response = await fetch(`${CANVAS_API_URL}/canvas/ai-assistant`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          prompt: args.transcription,
-          canvasState: args.currentWorkflow || { nodes: [], connections: [] },
-          availableTools,
-          voiceOptimized: true,
-          sessionId: args.sessionId
-        })
-      });
-      if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
-      const data = await response.json() as any;
-      let voiceResponse = data.finalMessage || data.message || "Done.";
-      if (voiceResponse.length > 200) voiceResponse = voiceResponse.substring(0, 197) + "...";
-      return { ...data, voiceResponse, voiceOptimized: true };
     }
 
     default:
@@ -599,7 +437,7 @@ async function handleAgentTool(name: string, args: Record<string, any>, marketpl
         `${AGENT_GATEWAY_URL}/agents/${encodeURIComponent(agent_id)}/sessions/${encodeURIComponent(sessionId!)}/chat`,
         {
           method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}`, "Accept": "text/event-stream" },
           body: JSON.stringify({ message, model })
         },
         300000
@@ -617,7 +455,14 @@ async function handleAgentTool(name: string, args: Record<string, any>, marketpl
         if (dataStr === "[DONE]") break;
         try {
           const event = JSON.parse(dataStr) as any;
-          if (event.type === "text") accumulatedText += typeof event.data === "string" ? event.data : "";
+          if (event.type === "text") {
+            if (typeof event.data === "string") accumulatedText += event.data;
+            else if (event.data?.text) accumulatedText += event.data.text;
+          }
+          if (event.type === "content_block_delta" && event.delta?.text) {
+            accumulatedText += event.delta.text;
+          }
+          if (event.type === "done" && event.data?.cost) cost = event.data.cost;
           if (event.type === "usage" && event.data?.cost) cost = event.data.cost;
         } catch { /* skip malformed SSE lines */ }
       }
@@ -725,7 +570,7 @@ function setupMCPHandlers(server: Server, marketplace: MarketplaceManager): void
     let result: any;
 
     try {
-      if (name.startsWith("canvas_") || name === "run_saved_canvas_workflow" || name === "run_workflow_and_wait" || name === "update_canvas_workflow" || name === "update_workflow_node") {
+      if (name.startsWith("canvas_") || name === "run_saved_canvas_workflow" || name === "run_workflow_and_wait") {
         result = await handleCanvasTool(name, args, marketplace);
       } else if (name.startsWith("agent_")) {
         result = await handleAgentTool(name, args, marketplace);
@@ -827,7 +672,7 @@ if (isStdio) {
     const { name, arguments: args = {} } = request.params;
     let result: any;
     try {
-      if (name.startsWith("canvas_") || name === "run_saved_canvas_workflow" || name === "run_workflow_and_wait" || name === "update_canvas_workflow" || name === "update_workflow_node") {
+      if (name.startsWith("canvas_") || name === "run_saved_canvas_workflow" || name === "run_workflow_and_wait") {
         result = await handleCanvasTool(name, args, stdioMarketplace);
       } else if (name.startsWith("agent_")) {
         result = await handleAgentTool(name, args, stdioMarketplace);
