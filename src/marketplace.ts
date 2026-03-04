@@ -32,6 +32,13 @@ interface RelayInfo {
   topUpUrl?: string;
 }
 
+interface ProviderHealthState {
+  healthy: boolean;
+  lastError?: string;
+  lastFailureAt?: number;
+  cooldownUntil?: number;
+}
+
 class GatewayPaymentRequiredError extends Error {
   relay?: RelayInfo;
 
@@ -45,6 +52,7 @@ class GatewayPaymentRequiredError extends Error {
 const GATEWAY_URL = "https://mcp.rickydata.org/mcp";
 const MCP_DISABLE_TIMEOUTS = process.env.MCP_DISABLE_TIMEOUTS !== "false";
 const MCP_HTTP_TIMEOUT_MS = parseInt(process.env.MCP_HTTP_TIMEOUT_MS || "0", 10);
+const PROVIDER_HEALTH_COOLDOWN_MS = parseInt(process.env.RESEARCH_PROVIDER_HEALTH_TTL_MS || "600000", 10);
 
 export const MARKETPLACE_TOOLS = [
   {
@@ -108,6 +116,7 @@ export class MarketplaceManager {
   private dynamicTools: GatewayToolDefinition[] = [];
   private server: Server | null = null;
   private currentUserToken: string = "";
+  private providerHealth: Map<string, ProviderHealthState> = new Map();
 
   setServer(server: Server): void {
     this.server = server;
@@ -123,6 +132,59 @@ export class MarketplaceManager {
 
   getUserToken(): string {
     return this.currentUserToken;
+  }
+
+  private providerKeyForServer(server: EnabledServer): string {
+    const composite = `${server.server_name} ${server.gateway_prefix}`.toLowerCase();
+    if (composite.includes("exa")) return "exa";
+    if (composite.includes("brave")) return "brave";
+    return server.server_id.toLowerCase();
+  }
+
+  private getProviderHealth(providerKey: string): ProviderHealthState {
+    const existing = this.providerHealth.get(providerKey);
+    if (existing) {
+      if (existing.cooldownUntil && Date.now() > existing.cooldownUntil) {
+        const resetState: ProviderHealthState = { healthy: true };
+        this.providerHealth.set(providerKey, resetState);
+        return resetState;
+      }
+      return existing;
+    }
+    const created: ProviderHealthState = { healthy: true };
+    this.providerHealth.set(providerKey, created);
+    return created;
+  }
+
+  private markProviderSuccess(providerKey: string): void {
+    this.providerHealth.set(providerKey, { healthy: true });
+  }
+
+  private markProviderFailure(providerKey: string, error: unknown): void {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    this.providerHealth.set(providerKey, {
+      healthy: false,
+      lastError: errorMessage,
+      lastFailureAt: Date.now(),
+      cooldownUntil: Date.now() + PROVIDER_HEALTH_COOLDOWN_MS,
+    });
+  }
+
+  private findBraveFallbackServer(): EnabledServer | null {
+    for (const server of this.enabledServers.values()) {
+      const providerKey = this.providerKeyForServer(server);
+      if (providerKey !== "brave") continue;
+      const health = this.getProviderHealth(providerKey);
+      if (health.healthy) return server;
+    }
+    return null;
+  }
+
+  private findSearchToolName(server: EnabledServer): string | null {
+    const candidates = server.tools
+      .map((tool) => tool.name)
+      .filter((name) => /search|web_search|query/i.test(name));
+    return candidates.length ? candidates[0] : null;
   }
 
   private baseUnitsToUsd(value?: string): string {
@@ -393,7 +455,58 @@ export class MarketplaceManager {
 
     // Use the gateway prefix (server name) instead of the UUID
     const serverInfo = this.enabledServers.get(serverId)!;
-    return await this.callGateway(`${serverInfo.gateway_prefix}__${originalToolName}`, args);
+    const providerKey = this.providerKeyForServer(serverInfo);
+    const health = this.getProviderHealth(providerKey);
+
+    const callServerTool = async (server: EnabledServer, tool: string): Promise<any> => {
+      const currentProviderKey = this.providerKeyForServer(server);
+      try {
+        const result = await this.callGateway(`${server.gateway_prefix}__${tool}`, args);
+        this.markProviderSuccess(currentProviderKey);
+        return result;
+      } catch (error) {
+        this.markProviderFailure(currentProviderKey, error);
+        throw error;
+      }
+    };
+
+    if (!health.healthy && providerKey === "exa") {
+      const braveFallback = this.findBraveFallbackServer();
+      if (braveFallback) {
+        const braveTool = this.findSearchToolName(braveFallback);
+        if (braveTool) {
+          const fallbackResult = await callServerTool(braveFallback, braveTool);
+          return {
+            fallback_used: true,
+            preferred_provider: "exa",
+            fallback_provider: "brave",
+            fallback_server_id: braveFallback.server_id,
+            fallback_tool: braveTool,
+            result: fallbackResult,
+          };
+        }
+      }
+      throw new Error(`Server "${serverId}" is in provider cooldown after recent failures and no Brave fallback is available.`);
+    }
+
+    try {
+      return await callServerTool(serverInfo, originalToolName);
+    } catch (error) {
+      if (providerKey !== "exa") throw error;
+      const braveFallback = this.findBraveFallbackServer();
+      if (!braveFallback) throw error;
+      const braveTool = this.findSearchToolName(braveFallback);
+      if (!braveTool) throw error;
+      const fallbackResult = await callServerTool(braveFallback, braveTool);
+      return {
+        fallback_used: true,
+        preferred_provider: "exa",
+        fallback_provider: "brave",
+        fallback_server_id: braveFallback.server_id,
+        fallback_tool: braveTool,
+        result: fallbackResult,
+      };
+    }
   }
 
   isDynamicTool(toolName: string): boolean {

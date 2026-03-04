@@ -20,6 +20,14 @@ const MCP_DISABLE_TIMEOUTS = process.env.MCP_DISABLE_TIMEOUTS !== "false";
 const MCP_HTTP_TIMEOUT_MS = parseInt(process.env.MCP_HTTP_TIMEOUT_MS || "0", 10);
 const WORKFLOW_CACHE_TTL_MS = parseInt(process.env.WORKFLOW_CACHE_TTL_MS || "900000", 10);
 const WORKFLOW_LOOKUP_LIMIT = parseInt(process.env.WORKFLOW_LOOKUP_LIMIT || "100", 10);
+const RUN_TAIL_TTL_MS = parseInt(process.env.RUN_TAIL_TTL_MS || "1800000", 10);
+const RUN_TAIL_MAX_EVENTS = parseInt(process.env.RUN_TAIL_MAX_EVENTS || "500", 10);
+const RUN_TAIL_MAX_RUNS = parseInt(process.env.RUN_TAIL_MAX_RUNS || "200", 10);
+const AGENT_STATUS_TTL_MS = parseInt(process.env.AGENT_STATUS_TTL_MS || "1800000", 10);
+const AGENT_RESUME_WAIT_SECONDS = parseInt(process.env.AGENT_RESUME_WAIT_SECONDS || "20", 10);
+const AGENT_STATUS_POLL_INTERVAL_MS = parseInt(process.env.AGENT_STATUS_POLL_INTERVAL_MS || "3000", 10);
+const AGENT_STATUS_POLL_MAX_MS = parseInt(process.env.AGENT_STATUS_POLL_MAX_MS || "90000", 10);
+const MAX_CITATION_VALIDATIONS = parseInt(process.env.MAX_CITATION_VALIDATIONS || "12", 10);
 
 interface WorkflowLike {
   entityId?: string;
@@ -48,6 +56,16 @@ interface ParsedSSEOptions {
   streamProgress?: boolean;
 }
 
+interface NodeMetric {
+  node_id: string;
+  status: string;
+  started_at: string | null;
+  ended_at: string | null;
+  duration_ms: number | null;
+  retry_count: number;
+  last_error?: string;
+}
+
 interface ParsedSSEResult {
   runId: string;
   status: string;
@@ -56,10 +74,89 @@ interface ParsedSSEResult {
   event_count: number;
   error?: string;
   events?: any[];
+  per_node_metrics?: NodeMetric[];
+  retry_summary?: {
+    total_retries: number;
+    nodes_with_retries: number;
+  };
+}
+
+interface RunTailEvent {
+  index: number;
+  timestamp: string;
+  type: string;
+  node_id?: string;
+  message?: string;
+  data?: any;
+}
+
+interface RunTailState {
+  run_id: string;
+  status: string;
+  next_index: number;
+  events: RunTailEvent[];
+  last_updated_at: number;
+}
+
+type AgentRequestStatus = "queued" | "running" | "still_running" | "completed" | "failed";
+
+interface AgentResumeStatusRequest {
+  request_id: string;
+  agent_id: string;
+  session_id: string;
+  status: AgentRequestStatus;
+  created_at: string;
+  updated_at: string;
+  user_message: string;
+  partial_text?: string;
+  final_text?: string;
+  cost?: string;
+  error?: string;
+  recovered?: boolean;
+  previous_session_id?: string;
+  next_action?: string;
+}
+
+type ResearchQualityPolicy = "none" | "warn" | "strict";
+
+interface CitationFlag {
+  url: string;
+  domain: string;
+  trusted: boolean;
+  verified: boolean;
+  reason?: string;
+}
+
+interface CitationReport {
+  policy: ResearchQualityPolicy;
+  trusted_domains: string[];
+  total_citations: number;
+  trusted_count: number;
+  unverified_count: number;
+  flags: CitationFlag[];
+}
+
+interface AgentCostControls {
+  max_tokens?: number | null;
+  max_tool_calls?: number | null;
+  max_turns?: number | null;
+  response_style?: "concise" | "detailed";
 }
 
 const workflowCacheById = new Map<string, WorkflowCacheEntry>();
 const workflowCacheByName = new Map<string, WorkflowCacheEntry>();
+const runTailById = new Map<string, RunTailState>();
+const agentResumeRequestsById = new Map<string, AgentResumeStatusRequest>();
+
+const DEFAULT_TRUSTED_DOMAINS = [
+  "nature.com",
+  "science.org",
+  "arxiv.org",
+  "pubmed.ncbi.nlm.nih.gov",
+  "nejm.org",
+  "thelancet.com",
+  "cell.com",
+];
 
 // ============================================================================
 // NODE TYPE CATALOG (static reference for canvas_get_available_tools)
@@ -251,6 +348,269 @@ function getCachedWorkflow(workflowId?: string, workflowName?: string): Workflow
   return null;
 }
 
+function pruneRunTailCache(now = Date.now()): void {
+  for (const [runId, state] of runTailById.entries()) {
+    if (now - state.last_updated_at > RUN_TAIL_TTL_MS) runTailById.delete(runId);
+  }
+  while (runTailById.size > RUN_TAIL_MAX_RUNS) {
+    const oldest = Array.from(runTailById.entries()).sort((a, b) => a[1].last_updated_at - b[1].last_updated_at)[0];
+    if (!oldest) break;
+    runTailById.delete(oldest[0]);
+  }
+}
+
+function ensureRunTail(runId: string): RunTailState {
+  pruneRunTailCache();
+  const existing = runTailById.get(runId);
+  if (existing) return existing;
+  const created: RunTailState = {
+    run_id: runId,
+    status: "unknown",
+    next_index: 0,
+    events: [],
+    last_updated_at: Date.now(),
+  };
+  runTailById.set(runId, created);
+  return created;
+}
+
+function appendRunTailEvent(runId: string, event: any, stateStatus?: string): void {
+  if (!runId) return;
+  const tail = ensureRunTail(runId);
+  const nodeId = event?.data?.nodeId || event?.data?.node_id || event?.nodeId || event?.node_id;
+  const message = typeof event?.data?.message === "string" ? event.data.message : undefined;
+  tail.events.push({
+    index: tail.next_index,
+    timestamp: new Date().toISOString(),
+    type: typeof event?.type === "string" ? event.type : "event",
+    node_id: typeof nodeId === "string" ? nodeId : undefined,
+    message,
+    data: event?.data,
+  });
+  tail.next_index += 1;
+  if (tail.events.length > RUN_TAIL_MAX_EVENTS) {
+    tail.events = tail.events.slice(-RUN_TAIL_MAX_EVENTS);
+  }
+  tail.last_updated_at = Date.now();
+  if (stateStatus) tail.status = stateStatus;
+}
+
+function pruneAgentResumeStatusCache(now = Date.now()): void {
+  for (const [requestId, request] of agentResumeRequestsById.entries()) {
+    const updatedAt = new Date(request.updated_at).getTime();
+    if (now - updatedAt > AGENT_STATUS_TTL_MS) {
+      agentResumeRequestsById.delete(requestId);
+    }
+  }
+}
+
+function createAgentResumeRequest(agentId: string, sessionId: string, message: string): AgentResumeStatusRequest {
+  pruneAgentResumeStatusCache();
+  const nowIso = new Date().toISOString();
+  const request: AgentResumeStatusRequest = {
+    request_id: randomUUID(),
+    agent_id: agentId,
+    session_id: sessionId,
+    status: "queued",
+    created_at: nowIso,
+    updated_at: nowIso,
+    user_message: message,
+  };
+  agentResumeRequestsById.set(request.request_id, request);
+  return request;
+}
+
+function updateAgentResumeRequest(requestId: string, updates: Partial<AgentResumeStatusRequest>): AgentResumeStatusRequest | null {
+  const existing = agentResumeRequestsById.get(requestId);
+  if (!existing) return null;
+  const merged: AgentResumeStatusRequest = {
+    ...existing,
+    ...updates,
+    updated_at: new Date().toISOString(),
+  };
+  agentResumeRequestsById.set(requestId, merged);
+  return merged;
+}
+
+function listUnique<T>(items: T[]): T[] {
+  return Array.from(new Set(items));
+}
+
+function normalizeTrustedDomains(input?: unknown): string[] {
+  const provided = Array.isArray(input)
+    ? input.map((d) => String(d || "").toLowerCase().trim()).filter(Boolean)
+    : [];
+  return listUnique(provided.length ? provided : DEFAULT_TRUSTED_DOMAINS);
+}
+
+function domainMatchesTrusted(domain: string, trustedDomains: string[]): boolean {
+  return trustedDomains.some((trusted) => domain === trusted || domain.endsWith(`.${trusted}`));
+}
+
+function extractCitationUrls(text: string): string[] {
+  if (!text) return [];
+  const markdownLinks = Array.from(text.matchAll(/\[[^\]]+\]\((https?:\/\/[^\s)]+)\)/gi)).map((m) => m[1]);
+  const plainUrls = Array.from(text.matchAll(/\bhttps?:\/\/[^\s<>)\]]+/gi)).map((m) => m[0]);
+  const urls: string[] = [];
+  for (const raw of [...markdownLinks, ...plainUrls]) {
+    try {
+      urls.push(new URL(raw).toString());
+    } catch {
+      // skip invalid URL
+    }
+  }
+  return listUnique(urls);
+}
+
+async function verifyCitationUrl(url: string): Promise<{ verified: boolean; reason?: string }> {
+  try {
+    const headResponse = await fetchWithTimeout(url, { method: "HEAD", redirect: "follow" }, 5000);
+    if (headResponse.ok) return { verified: true };
+    if (headResponse.status === 405 || headResponse.status === 403) {
+      const getResponse = await fetchWithTimeout(url, { method: "GET", redirect: "follow" }, 5000);
+      return getResponse.ok ? { verified: true } : { verified: false, reason: `HTTP ${getResponse.status}` };
+    }
+    return { verified: false, reason: `HTTP ${headResponse.status}` };
+  } catch (error) {
+    return { verified: false, reason: error instanceof Error ? error.message : "request_failed" };
+  }
+}
+
+function normalizeResearchQualityPolicy(input: unknown, agentId: string): ResearchQualityPolicy {
+  const raw = String(input || "").trim().toLowerCase();
+  if (raw === "warn" || raw === "strict" || raw === "none") return raw;
+  return agentId.toLowerCase().includes("research") ? "warn" : "none";
+}
+
+function buildResearchPolicyPrompt(policy: ResearchQualityPolicy, trustedDomains: string[]): string {
+  if (policy === "none") return "";
+  return [
+    "",
+    "Source policy:",
+    `- Prefer trusted domains: ${trustedDomains.join(", ")}`,
+    "- Include verifiable URLs for cited claims.",
+    policy === "strict"
+      ? "- Do not include a citation unless it is verifiable and from trusted sources when possible."
+      : "- If a citation is uncertain, explicitly label uncertainty.",
+  ].join("\n");
+}
+
+function applyResponseStyle(text: string, style: unknown): { text: string; truncated: boolean } {
+  const responseStyle = String(style || "concise").toLowerCase();
+  if (responseStyle !== "concise") return { text, truncated: false };
+  const conciseLimit = 6000;
+  if (text.length <= conciseLimit) return { text, truncated: false };
+  return { text: `${text.slice(0, conciseLimit)}\n... [truncated for concise response style]`, truncated: true };
+}
+
+function parsePositiveNumber(value: unknown): number | undefined {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function extractNodeId(event: any): string | null {
+  const value = event?.data?.nodeId || event?.data?.node_id || event?.nodeId || event?.node_id;
+  return typeof value === "string" && value ? value : null;
+}
+
+function extractEventTimestamp(event: any): string {
+  const raw = event?.timestamp || event?.data?.timestamp || event?.data?.at || event?.data?.createdAt;
+  if (typeof raw === "string" && raw) return raw;
+  if (typeof raw === "number" && Number.isFinite(raw)) return new Date(raw).toISOString();
+  return new Date().toISOString();
+}
+
+function ensureNodeMetric(
+  map: Map<string, NodeMetric>,
+  nodeId: string,
+): NodeMetric {
+  const existing = map.get(nodeId);
+  if (existing) return existing;
+  const created: NodeMetric = {
+    node_id: nodeId,
+    status: "unknown",
+    started_at: null,
+    ended_at: null,
+    duration_ms: null,
+    retry_count: 0,
+  };
+  map.set(nodeId, created);
+  return created;
+}
+
+function finalizeNodeMetrics(map: Map<string, NodeMetric>): { perNodeMetrics: NodeMetric[]; retrySummary: { total_retries: number; nodes_with_retries: number } } {
+  const perNodeMetrics = Array.from(map.values()).sort((a, b) => (a.node_id > b.node_id ? 1 : -1));
+  const totalRetries = perNodeMetrics.reduce((sum, metric) => sum + metric.retry_count, 0);
+  return {
+    perNodeMetrics,
+    retrySummary: {
+      total_retries: totalRetries,
+      nodes_with_retries: perNodeMetrics.filter((metric) => metric.retry_count > 0).length,
+    },
+  };
+}
+
+function extractCanonicalWorkflowId(workflow: any): string | undefined {
+  return getWorkflowId(workflow);
+}
+
+async function resolveCanonicalWorkflowId(
+  headers: Record<string, string>,
+  savedWorkflow: any,
+  workflowName?: string,
+): Promise<string> {
+  const directId = extractCanonicalWorkflowId(savedWorkflow);
+  if (directId) return directId;
+  if (workflowName) {
+    const byName = await findWorkflow(headers, undefined, workflowName);
+    const idByName = byName ? extractCanonicalWorkflowId(byName) : undefined;
+    if (idByName) return idByName;
+  }
+  throw new Error("Unable to resolve canonical workflow id from save/update response.");
+}
+
+function sameWorkflowDefinition(
+  existing: WorkflowLike,
+  candidate: { name?: string; description?: string; nodes?: any[]; connections?: any[] },
+): boolean {
+  try {
+    const existingNodes = typeof existing.nodesJson === "string" ? JSON.parse(existing.nodesJson) : (existing.nodes || []);
+    const existingConnections = typeof existing.edgesJson === "string" ? JSON.parse(existing.edgesJson) : (existing.edges || []);
+    const normalizedExisting = JSON.stringify({
+      name: existing.name || "",
+      description: existing.description || "",
+      nodes: normalizeWorkflowNodes(existingNodes || []),
+      connections: existingConnections || [],
+    });
+    const normalizedCandidate = JSON.stringify({
+      name: candidate.name || "",
+      description: candidate.description || "",
+      nodes: normalizeWorkflowNodes(candidate.nodes || []),
+      connections: candidate.connections || [],
+    });
+    return normalizedExisting === normalizedCandidate;
+  } catch {
+    return false;
+  }
+}
+
+function resolveAgentCostControls(args: Record<string, any>): AgentCostControls {
+  const maxTokens = parsePositiveNumber(args.max_tokens);
+  const maxToolCalls = parsePositiveNumber(args.max_tool_calls);
+  const maxTurns = parsePositiveNumber(args.max_turns);
+  const responseStyle = String(args.response_style || "concise").toLowerCase() === "detailed" ? "detailed" : "concise";
+  return {
+    ...(maxTokens ? { max_tokens: maxTokens } : {}),
+    ...(maxToolCalls ? { max_tool_calls: maxToolCalls } : {}),
+    ...(maxTurns ? { max_turns: maxTurns } : {}),
+    response_style: responseStyle,
+  };
+}
+
+function isSessionMismatchError(errorMessage: string): boolean {
+  return errorMessage.includes("tool_use") && errorMessage.includes("tool_result") && errorMessage.includes("without");
+}
+
 function parseWorkflowGraph(workflow: WorkflowLike, searchTerm: string): { nodes: any[]; edges: any[] } {
   let nodes: any[] = [];
   let edges: any[] = [];
@@ -270,6 +630,7 @@ function applySSEEvent(
   state: ParsedSSEResult,
   event: any,
   options: ParsedSSEOptions,
+  nodeMetrics: Map<string, NodeMetric>,
 ): void {
   if (options.includeEvents) {
     if (!state.events) state.events = [];
@@ -278,6 +639,45 @@ function applySSEEvent(
 
   if (event?.type === "run_started") {
     state.runId = event.data?.runId || state.runId;
+  }
+
+  const runHint = state.runId || event?.data?.runId || "";
+  if (runHint) {
+    appendRunTailEvent(runHint, event, state.status);
+  }
+
+  const nodeId = extractNodeId(event);
+  if (nodeId) {
+    const metric = ensureNodeMetric(nodeMetrics, nodeId);
+    const eventType = String(event?.type || "").toLowerCase();
+    const eventTimestamp = extractEventTimestamp(event);
+    if (eventType.includes("node_retry") || eventType.includes("node_retr")) {
+      metric.retry_count += 1;
+    }
+    if (
+      eventType === "node_started" ||
+      eventType === "node_running" ||
+      eventType === "node_executing" ||
+      eventType === "node_queued"
+    ) {
+      if (!metric.started_at) metric.started_at = eventTimestamp;
+      metric.status = eventType.replace("node_", "");
+    }
+    if (eventType === "node_failed" || eventType === "node_error") {
+      metric.status = "failed";
+      metric.ended_at = eventTimestamp;
+      if (metric.started_at && metric.ended_at) {
+        metric.duration_ms = Math.max(0, new Date(metric.ended_at).getTime() - new Date(metric.started_at).getTime());
+      }
+      if (typeof event?.data?.error === "string") metric.last_error = event.data.error;
+    }
+    if (eventType === "node_completed" || eventType === "node_succeeded" || eventType === "node_done") {
+      metric.status = "completed";
+      metric.ended_at = eventTimestamp;
+      if (metric.started_at && metric.ended_at) {
+        metric.duration_ms = Math.max(0, new Date(metric.ended_at).getTime() - new Date(metric.started_at).getTime());
+      }
+    }
   }
 
   if (event?.type === "node_log") {
@@ -291,9 +691,9 @@ function applySSEEvent(
         }
       }
       if (options.streamProgress) {
-        const runHint = state.runId || "pending";
+        const progressRunHint = state.runId || "pending";
         const nodeHint = event.data?.nodeId || "node";
-        console.error(`[canvas:${runHint}] ${nodeHint}: ${message}`);
+        console.error(`[canvas:${progressRunHint}] ${nodeHint}: ${message}`);
       }
     }
   }
@@ -302,6 +702,11 @@ function applySSEEvent(
     state.runId = event.data?.runId || state.runId;
     state.status = event.data?.status || "completed";
     state.results = event.data?.results || state.results;
+    if (state.runId) {
+      const tail = ensureRunTail(state.runId);
+      tail.status = state.status;
+      tail.last_updated_at = Date.now();
+    }
   }
 
   if (event?.type === "run_failed") {
@@ -310,12 +715,22 @@ function applySSEEvent(
     if (typeof event.data?.error === "string") {
       state.error = event.data.error;
     }
+    if (state.runId) {
+      const tail = ensureRunTail(state.runId);
+      tail.status = state.status;
+      tail.last_updated_at = Date.now();
+    }
   }
 
   if (event?.type === "error") {
     state.status = "failed";
     if (typeof event.data?.message === "string") {
       state.error = event.data.message;
+    }
+    if (state.runId) {
+      const tail = ensureRunTail(state.runId);
+      tail.status = state.status;
+      tail.last_updated_at = Date.now();
     }
   }
 }
@@ -393,7 +808,8 @@ const CANVAS_TOOLS = [
         name: { type: "string", description: "Workflow name" },
         description: { type: "string", description: "Workflow description" },
         nodes: { type: "array", description: "Array of workflow nodes" },
-        connections: { type: "array", description: "Array of connections" }
+        connections: { type: "array", description: "Array of connections" },
+        upsert_by_name: { type: "boolean", description: "If true, reuse an existing workflow with the same name when the definition is unchanged." }
       },
       required: ["name", "nodes", "connections"]
     }
@@ -435,7 +851,8 @@ const CANVAS_TOOLS = [
         stale_threshold_seconds: { type: "number", description: "Compatibility field for stale-run detection (not used by stream execution)." },
         include_live_logs: { type: "boolean", description: "Include node_log entries in the final response (default: true)." },
         live_log_limit: { type: "number", description: "Max live log entries to keep (default: 300)." },
-        stream_progress: { type: "boolean", description: "Emit incremental progress lines to server logs while waiting (default: false)." }
+        stream_progress: { type: "boolean", description: "Emit incremental progress lines to server logs while waiting (default: false)." },
+        include_events: { type: "boolean", description: "Include raw SSE events in final output for debugging." }
       }
     }
   },
@@ -457,6 +874,19 @@ const CANVAS_TOOLS = [
       properties: {
         run_id: { type: "string", description: "Run ID to get messages for" },
         node_id: { type: "string", description: "Optional: filter to a single node's data" }
+      },
+      required: ["run_id"]
+    }
+  },
+  {
+    name: "canvas_tail_run",
+    description: "Poll incremental logs/events for a run started through this MCP server.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        run_id: { type: "string", description: "Run ID to tail" },
+        after_index: { type: "number", description: "Return events with index > after_index (default: -1)" },
+        limit: { type: "number", description: "Max events to return (default: 100)" }
       },
       required: ["run_id"]
     }
@@ -499,7 +929,8 @@ const CANVAS_TOOLS = [
         name: { type: "string", description: "New workflow name" },
         description: { type: "string", description: "New workflow description" },
         nodes: { type: "array", description: "Updated nodes array (replaces existing)" },
-        connections: { type: "array", description: "Updated connections array (replaces existing)" }
+        connections: { type: "array", description: "Updated connections array (replaces existing)" },
+        upsert_by_name: { type: "boolean", description: "If true, no-op when same-name workflow already matches requested definition." }
       },
       required: ["workflow_id"]
     }
@@ -514,7 +945,8 @@ const CANVAS_TOOLS = [
         node_id: { type: "string", description: "ID of the node to update" },
         type: { type: "string", description: "Optional new node type" },
         position: { type: "object", description: "Optional new position {x, y}" },
-        data: { type: "object", description: "Data fields to merge into the node's existing data" }
+        data: { type: "object", description: "Data fields to merge into the node's existing data" },
+        upsert_by_name: { type: "boolean", description: "If true, no-op when resulting workflow matches an existing same-name version." }
       },
       required: ["workflow_id", "node_id"]
     }
@@ -579,7 +1011,15 @@ const AGENT_TOOLS = [
         agent_id: { type: "string", description: "Agent ID" },
         message: { type: "string", description: "Message to send" },
         session_id: { type: "string", description: "Session ID (auto-creates if omitted)" },
-        model: { type: "string", description: "Model: 'haiku', 'sonnet', or 'opus'" }
+        model: { type: "string", description: "Model: 'haiku', 'sonnet', or 'opus'" },
+        max_tokens: { type: "number", description: "Optional max output tokens (default: unlimited)." },
+        max_tool_calls: { type: "number", description: "Optional max tool calls for this request (default: unlimited)." },
+        max_turns: { type: "number", description: "Optional max internal turns (default: unlimited)." },
+        response_style: { type: "string", enum: ["concise", "detailed"], description: "Output verbosity style (default: concise)." },
+        research_quality_policy: { type: "string", enum: ["none", "warn", "strict"], description: "Citation/source quality policy." },
+        trusted_domains: { type: "array", description: "Preferred trusted source domains." },
+        validate_citations: { type: "boolean", description: "Verify cited URLs via HTTP checks." },
+        min_trusted_citations: { type: "number", description: "Strict-mode minimum trusted citations." }
       },
       required: ["agent_id", "message"]
     }
@@ -617,9 +1057,51 @@ const AGENT_TOOLS = [
         agent_id: { type: "string", description: "Agent ID" },
         session_id: { type: "string", description: "Session ID to resume" },
         message: { type: "string", description: "Message to send" },
-        model: { type: "string", description: "Model: 'haiku', 'sonnet', or 'opus'" }
+        model: { type: "string", description: "Model: 'haiku', 'sonnet', or 'opus'" },
+        wait_for_terminal_seconds: { type: "number", description: "How long to wait for terminal assistant output before returning still_running." },
+        max_tokens: { type: "number", description: "Optional max output tokens." },
+        max_tool_calls: { type: "number", description: "Optional max tool calls." },
+        max_turns: { type: "number", description: "Optional max turns." },
+        response_style: { type: "string", enum: ["concise", "detailed"], description: "Output verbosity style (default: concise)." },
+        research_quality_policy: { type: "string", enum: ["none", "warn", "strict"], description: "Citation/source quality policy." },
+        trusted_domains: { type: "array", description: "Preferred trusted source domains." },
+        validate_citations: { type: "boolean", description: "Verify cited URLs via HTTP checks." },
+        min_trusted_citations: { type: "number", description: "Strict-mode minimum trusted citations." }
       },
       required: ["agent_id", "session_id", "message"]
+    }
+  },
+  {
+    name: "agent_resume_session_async",
+    description: "Resume an existing session asynchronously. Poll completion via agent_get_session_status.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent_id: { type: "string", description: "Agent ID" },
+        session_id: { type: "string", description: "Session ID to resume" },
+        message: { type: "string", description: "Message to send" },
+        model: { type: "string", description: "Model: 'haiku', 'sonnet', or 'opus'" },
+        max_tokens: { type: "number", description: "Optional max output tokens." },
+        max_tool_calls: { type: "number", description: "Optional max tool calls." },
+        max_turns: { type: "number", description: "Optional max turns." },
+        response_style: { type: "string", enum: ["concise", "detailed"], description: "Output verbosity style (default: concise)." },
+        research_quality_policy: { type: "string", enum: ["none", "warn", "strict"], description: "Citation/source quality policy." },
+        trusted_domains: { type: "array", description: "Preferred trusted source domains." },
+        validate_citations: { type: "boolean", description: "Verify cited URLs via HTTP checks." },
+        min_trusted_citations: { type: "number", description: "Strict-mode minimum trusted citations." }
+      },
+      required: ["agent_id", "session_id", "message"]
+    }
+  },
+  {
+    name: "agent_get_session_status",
+    description: "Get status/result for agent_resume_session_async or a still_running resume request.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        request_id: { type: "string", description: "Request ID returned by async resume APIs." }
+      },
+      required: ["request_id"]
     }
   },
   {
@@ -703,7 +1185,8 @@ const WALLET_TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        limit: { type: "number", description: "Max results (default: 5)" }
+        limit: { type: "number", description: "Max results (default: 5)" },
+        cost_view: { type: "string", enum: ["summary", "full"], description: "summary (default) or full ledger entries." }
       }
     }
   },
@@ -729,6 +1212,7 @@ function parseSSEResult(sseText: string, options: ParsedSSEOptions = {}): Parsed
     logs: [],
     event_count: 0,
   };
+  const nodeMetrics = new Map<string, NodeMetric>();
 
   for (const line of sseText.split(/\r?\n/)) {
     let event: any;
@@ -739,9 +1223,12 @@ function parseSSEResult(sseText: string, options: ParsedSSEOptions = {}): Parsed
     }
     if (!event) continue;
     state.event_count += 1;
-    applySSEEvent(state, event, options);
+    applySSEEvent(state, event, options, nodeMetrics);
   }
 
+  const metrics = finalizeNodeMetrics(nodeMetrics);
+  state.per_node_metrics = metrics.perNodeMetrics;
+  state.retry_summary = metrics.retrySummary;
   return state;
 }
 
@@ -758,6 +1245,7 @@ async function parseSSEResponse(response: Response, options: ParsedSSEOptions = 
     logs: [],
     event_count: 0,
   };
+  const nodeMetrics = new Map<string, NodeMetric>();
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -779,7 +1267,7 @@ async function parseSSEResponse(response: Response, options: ParsedSSEOptions = 
       }
       if (!event) continue;
       state.event_count += 1;
-      applySSEEvent(state, event, options);
+      applySSEEvent(state, event, options, nodeMetrics);
     }
   }
 
@@ -788,13 +1276,16 @@ async function parseSSEResponse(response: Response, options: ParsedSSEOptions = 
       const event = parseSSELine(buffer);
       if (event) {
         state.event_count += 1;
-        applySSEEvent(state, event, options);
+        applySSEEvent(state, event, options, nodeMetrics);
       }
     } catch {
       // ignore trailing partial line
     }
   }
 
+  const metrics = finalizeNodeMetrics(nodeMetrics);
+  state.per_node_metrics = metrics.perNodeMetrics;
+  state.retry_summary = metrics.retrySummary;
   return state;
 }
 
@@ -844,6 +1335,22 @@ async function findWorkflow(headers: Record<string, string>, workflowId?: string
 
   const workflows = await fetchWorkflows(headers, undefined, WORKFLOW_LOOKUP_LIMIT);
   return findMatchingWorkflow(workflows, workflowId, workflowName);
+}
+
+async function findWorkflowByNameExact(headers: Record<string, string>, workflowName?: string): Promise<WorkflowLike | null> {
+  if (!workflowName) return null;
+  const normalized = workflowName.trim().toLowerCase();
+  if (!normalized) return null;
+
+  const cached = getCachedWorkflow(undefined, workflowName);
+  if (cached && String(cached.name || "").trim().toLowerCase() === normalized) return cached;
+
+  const searched = await fetchWorkflows(headers, workflowName, WORKFLOW_LOOKUP_LIMIT).catch(() => [] as WorkflowLike[]);
+  const exactFromSearch = searched.find((workflow) => String(workflow.name || "").trim().toLowerCase() === normalized);
+  if (exactFromSearch) return exactFromSearch;
+
+  const workflows = await fetchWorkflows(headers, undefined, WORKFLOW_LOOKUP_LIMIT);
+  return workflows.find((workflow) => String(workflow.name || "").trim().toLowerCase() === normalized) || null;
 }
 
 function buildWorkflowExecutionRequest(
@@ -934,6 +1441,33 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       // Normalize model names in nodes before saving
       const saveArgs = { ...args };
       if (Array.isArray(saveArgs.nodes)) saveArgs.nodes = normalizeWorkflowNodes(saveArgs.nodes);
+      const upsertByName = Boolean(saveArgs.upsert_by_name);
+      let previousWorkflowId: string | undefined;
+
+      if (upsertByName && saveArgs.name) {
+        const existing = await findWorkflowByNameExact(headers, String(saveArgs.name));
+        previousWorkflowId = existing ? extractCanonicalWorkflowId(existing) : undefined;
+        if (existing && sameWorkflowDefinition(existing, {
+          name: saveArgs.name,
+          description: saveArgs.description || "",
+          nodes: saveArgs.nodes || [],
+          connections: saveArgs.connections || [],
+        })) {
+          const existingId = extractCanonicalWorkflowId(existing);
+          if (existingId) {
+            return {
+              success: true,
+              upserted: true,
+              version_created: false,
+              canonical_workflow_id: existingId,
+              previous_workflow_id: existingId,
+              workflowName: saveArgs.name,
+              message: "Existing workflow matched requested definition. Reused canonical workflow ID.",
+            };
+          }
+        }
+      }
+
       const response = await fetchWithTimeout(
         `${CANVAS_API_URL}/canvas/workflows`,
         { method: "POST", headers, body: JSON.stringify(saveArgs) },
@@ -941,7 +1475,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       );
       if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
       const saved = await response.json() as any;
-      const workflowId = getWorkflowId(saved) || saved.workflowId || saved.entityId || saved.id;
+      const workflowId = await resolveCanonicalWorkflowId(headers, saved, String(saveArgs.name || ""));
       const syntheticWorkflow: WorkflowLike = {
         entityId: workflowId,
         workflowId,
@@ -952,7 +1486,14 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
         createdAt: new Date().toISOString(),
       };
       cacheWorkflow(syntheticWorkflow);
-      return saved;
+      return {
+        ...saved,
+        success: true,
+        canonical_workflow_id: workflowId,
+        version_created: true,
+        upserted: upsertByName,
+        ...(previousWorkflowId ? { previous_workflow_id: previousWorkflowId } : {}),
+      };
     }
 
     case "canvas_get_workflows": {
@@ -1039,6 +1580,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
         max_wait_seconds: maxWaitSeconds > 0 ? maxWaitSeconds : null,
         poll_interval_seconds: args.poll_interval_seconds ?? null,
         stale_threshold_seconds: args.stale_threshold_seconds ?? null,
+        event_cursor: typeof result.event_count === "number" ? Math.max(-1, result.event_count - 1) : -1,
       };
     }
 
@@ -1102,7 +1644,61 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
         messages,
         approvals: args.node_id ? approvals.filter((a: any) => a.nodeId === args.node_id) : approvals,
         logs,
-        error: run.error
+        error: run.error,
+        per_node_metrics: (() => {
+          const tail = runTailById.get(run.runId || args.run_id);
+          if (!tail) return [];
+          const nodeMetricMap = new Map<string, NodeMetric>();
+          for (const event of tail.events) {
+            const nodeId = event.node_id;
+            if (!nodeId) continue;
+            const metric = ensureNodeMetric(nodeMetricMap, nodeId);
+            if (event.type === "node_started" && !metric.started_at) {
+              metric.started_at = event.timestamp;
+              metric.status = "running";
+            }
+            if (event.type === "node_retry") metric.retry_count += 1;
+            if (event.type === "node_completed") {
+              metric.status = "completed";
+              metric.ended_at = event.timestamp;
+              if (metric.started_at && metric.ended_at) {
+                metric.duration_ms = Math.max(0, new Date(metric.ended_at).getTime() - new Date(metric.started_at).getTime());
+              }
+            }
+            if (event.type === "node_failed") {
+              metric.status = "failed";
+              metric.ended_at = event.timestamp;
+            }
+          }
+          return finalizeNodeMetrics(nodeMetricMap).perNodeMetrics;
+        })()
+      };
+    }
+
+    case "canvas_tail_run": {
+      pruneRunTailCache();
+      const runId = String(args.run_id);
+      const tail = runTailById.get(runId);
+      if (!tail) {
+        return {
+          run_id: runId,
+          status: "unknown",
+          events: [],
+          next_index: Number(args.after_index ?? -1) + 1,
+          message: "No in-memory tail data found for this run. Ensure run was started via this MCP server.",
+        };
+      }
+      const afterIndex = Number.isFinite(Number(args.after_index)) ? Number(args.after_index) : -1;
+      const limit = Number.isFinite(Number(args.limit)) && Number(args.limit) > 0 ? Number(args.limit) : 100;
+      const events = tail.events.filter((event) => event.index > afterIndex).slice(0, limit);
+      const lastEvent = events.length ? events[events.length - 1] : null;
+      return {
+        run_id: runId,
+        status: tail.status,
+        events,
+        next_index: lastEvent ? lastEvent.index + 1 : afterIndex + 1,
+        has_more: tail.events.some((event) => event.index > (lastEvent?.index ?? afterIndex)),
+        last_updated_at: new Date(tail.last_updated_at).toISOString(),
       };
     }
 
@@ -1218,6 +1814,20 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
         connections: args.connections || existingEdges.map((e: any) => ({ source: e.source, target: e.target }))
       };
 
+      if (args.upsert_by_name && sameWorkflowDefinition(wf, savePayload)) {
+        const existingId = extractCanonicalWorkflowId(wf);
+        if (!existingId) throw new Error(`Workflow "${args.workflow_id}" resolved but has no canonical ID.`);
+        return {
+          success: true,
+          upserted: true,
+          version_created: false,
+          canonical_workflow_id: existingId,
+          previous_workflow_id: existingId,
+          name: savePayload.name,
+          message: "Workflow already matches requested changes. No new version created."
+        };
+      }
+
       const saveResponse = await fetchWithTimeout(
         `${CANVAS_API_URL}/canvas/workflows`,
         { method: "POST", headers, body: JSON.stringify(savePayload) },
@@ -1225,9 +1835,10 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       );
       if (!saveResponse.ok) throw new Error(`Failed to save workflow: ${await saveResponse.text()}`);
       const saved = await saveResponse.json() as any;
+      const canonicalWorkflowId = await resolveCanonicalWorkflowId(headers, saved, String(savePayload.name || ""));
       cacheWorkflow({
-        entityId: getWorkflowId(saved),
-        workflowId: saved.workflowId || saved.entityId || saved.id,
+        entityId: canonicalWorkflowId,
+        workflowId: canonicalWorkflowId,
         name: savePayload.name,
         description: savePayload.description,
         nodesJson: JSON.stringify(savePayload.nodes || []),
@@ -1236,10 +1847,12 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
 
       return {
         success: true,
-        previous_id: args.workflow_id,
-        new_entity_id: saved.entityId || saved.id || saved.workflow?.entityId || saved.workflow?.id || "check canvas_get_workflows for new version",
+        previous_workflow_id: args.workflow_id,
+        canonical_workflow_id: canonicalWorkflowId,
+        version_created: true,
+        upserted: Boolean(args.upsert_by_name),
         name: savePayload.name,
-        message: "Saved as new version (Geo storage is immutable). Use the new entityId for future references."
+        message: "Saved as new version (Geo storage is immutable). Use canonical_workflow_id for future references."
       };
     }
 
@@ -1270,6 +1883,20 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
         connections: edges.map((e: any) => ({ source: e.source, target: e.target }))
       };
 
+      if (args.upsert_by_name && sameWorkflowDefinition(wf, savePayload)) {
+        const existingId = extractCanonicalWorkflowId(wf);
+        if (!existingId) throw new Error(`Workflow "${args.workflow_id}" resolved but has no canonical ID.`);
+        return {
+          success: true,
+          upserted: true,
+          version_created: false,
+          canonical_workflow_id: existingId,
+          previous_workflow_id: existingId,
+          updated_node_id: args.node_id,
+          message: "Node changes produced no effective workflow diff. Reused existing workflow ID."
+        };
+      }
+
       const saveResponse = await fetchWithTimeout(
         `${CANVAS_API_URL}/canvas/workflows`,
         { method: "POST", headers, body: JSON.stringify(savePayload) },
@@ -1277,9 +1904,10 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       );
       if (!saveResponse.ok) throw new Error(`Failed to save workflow: ${await saveResponse.text()}`);
       const saved = await saveResponse.json() as any;
+      const canonicalWorkflowId = await resolveCanonicalWorkflowId(headers, saved, String(savePayload.name || ""));
       cacheWorkflow({
-        entityId: getWorkflowId(saved),
-        workflowId: saved.workflowId || saved.entityId || saved.id,
+        entityId: canonicalWorkflowId,
+        workflowId: canonicalWorkflowId,
         name: savePayload.name,
         description: savePayload.description,
         nodesJson: JSON.stringify(savePayload.nodes || []),
@@ -1288,8 +1916,10 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
 
       return {
         success: true,
-        previous_id: args.workflow_id,
-        new_entity_id: saved.entityId || saved.id || saved.workflow?.entityId || saved.workflow?.id || "check canvas_get_workflows for new version",
+        previous_workflow_id: args.workflow_id,
+        canonical_workflow_id: canonicalWorkflowId,
+        version_created: true,
+        upserted: Boolean(args.upsert_by_name),
         updated_node_id: args.node_id,
         message: "Node updated and saved as new version (Geo storage is immutable)."
       };
@@ -1347,16 +1977,20 @@ async function handleAgentTool(name: string, args: Record<string, any>, marketpl
     ? { "Content-Type": "application/json", "Authorization": `Bearer ${token}` }
     : { "Content-Type": "application/json" };
 
-  const parseAgentChatResponse = (responseText: string): { text: string; cost?: string } => {
+  const parseAgentChatResponse = (responseText: string): { text: string; cost?: string; terminal: boolean } => {
     let accumulatedText = "";
     let cost: string | undefined;
+    let terminal = false;
 
     const isSSE = responseText.includes("data: ") || responseText.includes("data:");
     if (isSSE) {
       for (const line of responseText.split(/\r?\n/)) {
         if (!line.startsWith("data: ") && !line.startsWith("data:")) continue;
         const dataStr = line.startsWith("data: ") ? line.slice(6) : line.slice(5);
-        if (dataStr === "[DONE]") break;
+        if (dataStr === "[DONE]") {
+          terminal = true;
+          break;
+        }
         try {
           const event = JSON.parse(dataStr) as any;
           if (event.type === "text") {
@@ -1368,6 +2002,9 @@ async function handleAgentTool(name: string, args: Record<string, any>, marketpl
           }
           if (event.type === "done" && event.data?.cost) cost = event.data.cost;
           if (event.type === "usage" && event.data?.cost) cost = event.data.cost;
+          if (event.type === "done" || event.type === "message_stop" || event.type === "completed") {
+            terminal = true;
+          }
           if (event.type === "error") {
             throw new Error(`Agent error: ${event.data?.message || JSON.stringify(event.data)}`);
           }
@@ -1381,8 +2018,10 @@ async function handleAgentTool(name: string, args: Record<string, any>, marketpl
         const jsonResp = JSON.parse(responseText) as any;
         accumulatedText = jsonResp.text || jsonResp.response || jsonResp.content || responseText;
         cost = jsonResp.cost;
+        terminal = true;
       } catch {
         accumulatedText = responseText;
+        terminal = true;
       }
     }
 
@@ -1390,7 +2029,7 @@ async function handleAgentTool(name: string, args: Record<string, any>, marketpl
       accumulatedText = `[No text extracted from response. Raw length: ${responseText.length}, starts with: ${responseText.slice(0, 100)}]`;
     }
 
-    return { text: accumulatedText, cost };
+    return { text: accumulatedText, cost, terminal };
   };
 
   const createSession = async (agentId: string, modelInput?: string): Promise<string> => {
@@ -1412,27 +2051,304 @@ async function handleAgentTool(name: string, args: Record<string, any>, marketpl
     return sessionData.id;
   };
 
+  const getSession = async (agentId: string, sessionId: string): Promise<any> => {
+    const response = await fetchWithTimeout(
+      `${AGENT_GATEWAY_URL}/agents/${encodeURIComponent(agentId)}/sessions/${encodeURIComponent(sessionId)}`,
+      { headers: authHeaders },
+      15000
+    );
+    if (!response.ok) throw new Error(`Failed to get session: ${response.status} ${await response.text()}`);
+    return await response.json();
+  };
+
+  const normalizeMessageContent = (content: any): string => {
+    if (typeof content === "string") return content;
+    if (Array.isArray(content)) return content.map((item) => normalizeMessageContent(item)).filter(Boolean).join("\n");
+    if (content && typeof content === "object") {
+      if (typeof content.text === "string") return content.text;
+      if (typeof content.content === "string") return content.content;
+    }
+    return "";
+  };
+
+  const extractTerminalAssistantMessage = (messages: any[], sinceMs: number): string | null => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const message = messages[i];
+      if (String(message?.role || "") !== "assistant") continue;
+      if (message?.toolUse || (Array.isArray(message?.toolUses) && message.toolUses.length > 0)) continue;
+      const timestampRaw = message?.timestamp;
+      const timestampMs = typeof timestampRaw === "number"
+        ? timestampRaw
+        : (typeof timestampRaw === "string" ? Date.parse(timestampRaw) : 0);
+      if (Number.isFinite(timestampMs) && timestampMs < sinceMs) continue;
+      const text = normalizeMessageContent(message?.content);
+      if (text) return text;
+    }
+    return null;
+  };
+
+  const evaluateCitationReport = async (
+    text: string,
+    agentId: string,
+    requestArgs: Record<string, any>,
+  ): Promise<{ report?: CitationReport; warnings: string[]; strictError?: string }> => {
+    const policy = normalizeResearchQualityPolicy(requestArgs.research_quality_policy, agentId);
+    if (policy === "none") return { warnings: [] };
+
+    const trustedDomains = normalizeTrustedDomains(requestArgs.trusted_domains);
+    const urls = extractCitationUrls(text);
+    const urlsToValidate = urls.slice(0, MAX_CITATION_VALIDATIONS);
+    const warnings: string[] = [];
+    if (urls.length > MAX_CITATION_VALIDATIONS) {
+      warnings.push(`Validated first ${MAX_CITATION_VALIDATIONS} citations out of ${urls.length} total.`);
+    }
+
+    const shouldValidate = requestArgs.validate_citations !== undefined
+      ? Boolean(requestArgs.validate_citations)
+      : true;
+
+    const flags: CitationFlag[] = [];
+    for (const url of urlsToValidate) {
+      let domain = "unknown";
+      try {
+        domain = new URL(url).hostname.toLowerCase();
+      } catch {
+        flags.push({ url, domain, trusted: false, verified: false, reason: "invalid_url" });
+        continue;
+      }
+      const trusted = domainMatchesTrusted(domain, trustedDomains);
+      if (!shouldValidate) {
+        flags.push({ url, domain, trusted, verified: true });
+        continue;
+      }
+      const verification = await verifyCitationUrl(url);
+      flags.push({
+        url,
+        domain,
+        trusted,
+        verified: verification.verified,
+        ...(verification.reason ? { reason: verification.reason } : {}),
+      });
+    }
+
+    const trustedCount = flags.filter((flag) => flag.trusted && flag.verified).length;
+    const unverifiedCount = flags.filter((flag) => !flag.verified).length;
+    const report: CitationReport = {
+      policy,
+      trusted_domains: trustedDomains,
+      total_citations: urls.length,
+      trusted_count: trustedCount,
+      unverified_count: unverifiedCount,
+      flags: flags.filter((flag) => !flag.trusted || !flag.verified),
+    };
+
+    if (policy === "warn") {
+      if (report.flags.length > 0) {
+        warnings.push(`Citation quality warnings: ${report.flags.length} citation(s) are untrusted or unverified.`);
+      }
+      return { report, warnings };
+    }
+
+    const minTrusted = parsePositiveNumber(requestArgs.min_trusted_citations) || 1;
+    if (unverifiedCount > 0 || trustedCount < minTrusted) {
+      return {
+        report,
+        warnings,
+        strictError: `Strict citation policy failed: trusted_count=${trustedCount}, min_trusted_citations=${minTrusted}, unverified_count=${unverifiedCount}.`,
+      };
+    }
+    return { report, warnings };
+  };
+
   const sendChat = async (
     agentId: string,
     sessionId: string,
     message: string,
     modelInput?: string,
-  ): Promise<{ text: string; cost?: string }> => {
+    requestArgs?: Record<string, any>,
+    timeoutMs?: number,
+  ): Promise<{ text: string; cost?: string; terminal: boolean }> => {
     const model = normalizeGatewayModelName(modelInput, "haiku");
+    const costControls = resolveAgentCostControls(requestArgs || {});
+    const body: Record<string, any> = { message, model };
+    if (costControls.max_tokens) body.maxTokens = costControls.max_tokens;
+    if (costControls.max_tool_calls) body.maxToolCalls = costControls.max_tool_calls;
+    if (costControls.max_turns) body.maxTurns = costControls.max_turns;
     const chatResponse = await fetchWithTimeout(
       `${AGENT_GATEWAY_URL}/agents/${encodeURIComponent(agentId)}/sessions/${encodeURIComponent(sessionId)}/chat`,
       {
         method: "POST",
         headers: { ...authHeaders, "Accept": "text/event-stream" },
-        body: JSON.stringify({ message, model }),
+        body: JSON.stringify(body),
       },
-      300000
+      timeoutMs ?? 300000
     );
     if (!chatResponse.ok) {
       throw new Error(`Chat failed: ${chatResponse.status} ${await chatResponse.text()}`);
     }
     const responseText = await chatResponse.text();
     return parseAgentChatResponse(responseText);
+  };
+
+  const finalizeAgentText = async (
+    text: string,
+    agentId: string,
+    requestArgs: Record<string, any>,
+  ): Promise<{
+    text: string;
+    response_style: "concise" | "detailed";
+    truncated: boolean;
+    citation_report?: CitationReport;
+    warnings?: string[];
+  }> => {
+    const controls = resolveAgentCostControls(requestArgs);
+    const styled = applyResponseStyle(text, controls.response_style);
+    const citationEval = await evaluateCitationReport(styled.text, agentId, requestArgs);
+    if (citationEval.strictError) {
+      throw new Error(citationEval.strictError);
+    }
+    return {
+      text: styled.text,
+      response_style: controls.response_style || "concise",
+      truncated: styled.truncated,
+      ...(citationEval.report ? { citation_report: citationEval.report } : {}),
+      ...(citationEval.warnings.length ? { warnings: citationEval.warnings } : {}),
+    };
+  };
+
+  const pollResumeRequestUntilTerminal = async (
+    request: AgentResumeStatusRequest,
+    requestArgs: Record<string, any>,
+    sinceMs: number,
+  ): Promise<void> => {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < AGENT_STATUS_POLL_MAX_MS) {
+      try {
+        const session = await getSession(request.agent_id, request.session_id);
+        const terminalText = extractTerminalAssistantMessage(Array.isArray(session?.messages) ? session.messages : [], sinceMs);
+        if (terminalText) {
+          const finalized = await finalizeAgentText(terminalText, request.agent_id, requestArgs);
+          updateAgentResumeRequest(request.request_id, {
+            status: "completed",
+            final_text: finalized.text,
+            partial_text: finalized.text,
+            next_action: undefined,
+          });
+          return;
+        }
+      } catch (pollError) {
+        updateAgentResumeRequest(request.request_id, {
+          status: "failed",
+          error: pollError instanceof Error ? pollError.message : String(pollError),
+          next_action: undefined,
+        });
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, AGENT_STATUS_POLL_INTERVAL_MS));
+    }
+
+    updateAgentResumeRequest(request.request_id, {
+      status: "still_running",
+      next_action: "Call agent_get_session_status with this request_id to continue polling.",
+    });
+  };
+
+  const executeResume = async (
+    requestArgs: Record<string, any>,
+  ): Promise<{
+    status: "completed" | "still_running";
+    session_id: string;
+    previous_session_id?: string;
+    recovered?: boolean;
+    text?: string;
+    cost?: string;
+    response_style?: "concise" | "detailed";
+    truncated?: boolean;
+    citation_report?: CitationReport;
+    warnings?: string[];
+  }> => {
+    const agentId = String(requestArgs.agent_id);
+    const sessionId = String(requestArgs.session_id);
+    const model = normalizeGatewayModelName(requestArgs.model, "haiku");
+    const qualityPolicy = normalizeResearchQualityPolicy(requestArgs.research_quality_policy, agentId);
+    const trustedDomains = normalizeTrustedDomains(requestArgs.trusted_domains);
+    const policyPrompt = buildResearchPolicyPrompt(qualityPolicy, trustedDomains);
+    const outboundMessage = policyPrompt ? `${String(requestArgs.message)}\n${policyPrompt}` : String(requestArgs.message);
+    const waitSeconds = parsePositiveNumber(requestArgs.wait_for_terminal_seconds) || AGENT_RESUME_WAIT_SECONDS;
+    const timeoutMs = waitSeconds * 1000;
+
+    try {
+      const chat = await sendChat(agentId, sessionId, outboundMessage, model, requestArgs, timeoutMs);
+      if (!chat.terminal) {
+        return { status: "still_running", session_id: sessionId, text: chat.text, cost: chat.cost };
+      }
+      const finalized = await finalizeAgentText(chat.text, agentId, requestArgs);
+      return {
+        status: "completed",
+        session_id: sessionId,
+        text: finalized.text,
+        cost: chat.cost,
+        response_style: finalized.response_style,
+        truncated: finalized.truncated,
+        citation_report: finalized.citation_report,
+        warnings: finalized.warnings,
+      };
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        return { status: "still_running", session_id: sessionId };
+      }
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      if (!isSessionMismatchError(errorMessage)) throw error;
+
+      // Recovery path for corrupted tool-use history: start a fresh session and continue.
+      const sessionDetailsResponse = await fetchWithTimeout(
+        `${AGENT_GATEWAY_URL}/agents/${encodeURIComponent(agentId)}/sessions/${encodeURIComponent(sessionId)}`,
+        { headers: authHeaders },
+        15000
+      );
+      let contextSummary = "";
+      if (sessionDetailsResponse.ok) {
+        const details = await sessionDetailsResponse.json() as any;
+        const recentMessages: any[] = Array.isArray(details?.messages) ? details.messages.slice(-6) : [];
+        const summarized = recentMessages
+          .map((m: any) => `${m.role || "unknown"}: ${String(m.content || "").slice(0, 280)}`)
+          .join("\n");
+        if (summarized) contextSummary = summarized;
+      }
+
+      const recoveredSessionId = await createSession(agentId, model);
+      const recoveryPrompt = [
+        "Continue the previous session after a transport state reset.",
+        contextSummary ? `Recent context:\n${contextSummary}` : "Recent context unavailable.",
+        `User follow-up:\n${String(requestArgs.message)}`,
+        policyPrompt ? `\n${policyPrompt}` : "",
+      ].join("\n\n");
+
+      const recoveredChat = await sendChat(agentId, recoveredSessionId, recoveryPrompt, model, requestArgs, timeoutMs);
+      if (!recoveredChat.terminal) {
+        return {
+          status: "still_running",
+          session_id: recoveredSessionId,
+          previous_session_id: sessionId,
+          recovered: true,
+          text: recoveredChat.text,
+          cost: recoveredChat.cost,
+        };
+      }
+      const finalized = await finalizeAgentText(recoveredChat.text, agentId, requestArgs);
+      return {
+        status: "completed",
+        session_id: recoveredSessionId,
+        previous_session_id: sessionId,
+        recovered: true,
+        text: finalized.text,
+        cost: recoveredChat.cost,
+        response_style: finalized.response_style,
+        truncated: finalized.truncated,
+        citation_report: finalized.citation_report,
+        warnings: finalized.warnings,
+      };
+    }
   };
 
   switch (name) {
@@ -1500,6 +2416,10 @@ async function handleAgentTool(name: string, args: Record<string, any>, marketpl
       if (!token) return { success: false, error: "No auth token available." };
       const { agent_id, message, session_id } = args;
       const model = normalizeGatewayModelName(args.model, "haiku");
+      const qualityPolicy = normalizeResearchQualityPolicy(args.research_quality_policy, String(agent_id));
+      const trustedDomains = normalizeTrustedDomains(args.trusted_domains);
+      const policyPrompt = buildResearchPolicyPrompt(qualityPolicy, trustedDomains);
+      const outboundMessage = policyPrompt ? `${String(message)}\n${policyPrompt}` : String(message);
 
       // Get or create session
       let sessionId = session_id;
@@ -1507,14 +2427,20 @@ async function handleAgentTool(name: string, args: Record<string, any>, marketpl
         sessionId = await createSession(String(agent_id), model);
       }
 
-      const chat = await sendChat(String(agent_id), String(sessionId), String(message), model);
+      const chat = await sendChat(String(agent_id), String(sessionId), outboundMessage, model, args);
+      const finalized = await finalizeAgentText(chat.text, String(agent_id), args);
 
       return {
         success: true,
         agent_id,
         session_id: sessionId,
-        text: chat.text,
+        text: finalized.text,
         cost: chat.cost,
+        response_style: finalized.response_style,
+        truncated: finalized.truncated,
+        ...(finalized.citation_report ? { citation_report: finalized.citation_report } : {}),
+        ...(finalized.warnings?.length ? { warnings: finalized.warnings } : {}),
+        terminal: chat.terminal,
         message: `Use session_id="${sessionId}" for follow-up messages.`
       };
     }
@@ -1563,56 +2489,133 @@ async function handleAgentTool(name: string, args: Record<string, any>, marketpl
 
     case "agent_resume_session": {
       if (!token) return { success: false, error: "No auth token available." };
-      const { agent_id, session_id, message } = args;
-      const model = normalizeGatewayModelName(args.model, "haiku");
-      try {
-        const chat = await sendChat(String(agent_id), String(session_id), String(message), model);
-        return { success: true, agent_id, session_id, text: chat.text, cost: chat.cost, message: `Session "${session_id}" resumed.` };
-      } catch (error) {
-        const errMessage = error instanceof Error ? error.message : String(error);
-        const sessionMismatch =
-          errMessage.includes("tool_use") &&
-          errMessage.includes("tool_result") &&
-          errMessage.includes("without");
-
-        if (!sessionMismatch) throw error;
-
-        // Recovery path for corrupted tool-use history: start a fresh session and continue.
-        const sessionDetailsResponse = await fetchWithTimeout(
-          `${AGENT_GATEWAY_URL}/agents/${encodeURIComponent(String(agent_id))}/sessions/${encodeURIComponent(String(session_id))}`,
-          { headers: authHeaders },
-          15000
-        );
-
-        let contextSummary = "";
-        if (sessionDetailsResponse.ok) {
-          const details = await sessionDetailsResponse.json() as any;
-          const recentMessages: any[] = Array.isArray(details?.messages) ? details.messages.slice(-6) : [];
-          const summarized = recentMessages
-            .map((m: any) => `${m.role || "unknown"}: ${String(m.content || "").slice(0, 280)}`)
-            .join("\n");
-          if (summarized) contextSummary = summarized;
-        }
-
-        const recoveredSessionId = await createSession(String(agent_id), model);
-        const recoveryPrompt = [
-          "Continue the previous session after a transport state reset.",
-          contextSummary ? `Recent context:\n${contextSummary}` : "Recent context unavailable.",
-          `User follow-up:\n${String(message)}`,
-        ].join("\n\n");
-
-        const recoveredChat = await sendChat(String(agent_id), recoveredSessionId, recoveryPrompt, model);
+      const requestStartedAt = Date.now();
+      const resumeResult = await executeResume(args);
+      if (resumeResult.status === "completed") {
         return {
           success: true,
-          recovered: true,
-          previous_session_id: session_id,
-          session_id: recoveredSessionId,
-          agent_id,
-          text: recoveredChat.text,
-          cost: recoveredChat.cost,
-          message: `Recovered from session state mismatch by creating session "${recoveredSessionId}".`,
+          status: "completed",
+          agent_id: args.agent_id,
+          session_id: resumeResult.session_id,
+          ...(resumeResult.previous_session_id ? { previous_session_id: resumeResult.previous_session_id } : {}),
+          recovered: Boolean(resumeResult.recovered),
+          text: resumeResult.text,
+          cost: resumeResult.cost,
+          response_style: resumeResult.response_style,
+          truncated: resumeResult.truncated,
+          ...(resumeResult.citation_report ? { citation_report: resumeResult.citation_report } : {}),
+          ...(resumeResult.warnings?.length ? { warnings: resumeResult.warnings } : {}),
+          message: `Session "${resumeResult.session_id}" resumed.`,
         };
       }
+
+      const request = createAgentResumeRequest(String(args.agent_id), String(resumeResult.session_id), String(args.message));
+      updateAgentResumeRequest(request.request_id, {
+        status: "still_running",
+        partial_text: resumeResult.text,
+        cost: resumeResult.cost,
+        recovered: Boolean(resumeResult.recovered),
+        previous_session_id: resumeResult.previous_session_id,
+        next_action: "Call agent_get_session_status with request_id for completion.",
+      });
+      void pollResumeRequestUntilTerminal(request, args, requestStartedAt);
+
+      return {
+        success: true,
+        status: "still_running",
+        request_id: request.request_id,
+        agent_id: args.agent_id,
+        session_id: resumeResult.session_id,
+        ...(resumeResult.previous_session_id ? { previous_session_id: resumeResult.previous_session_id } : {}),
+        recovered: Boolean(resumeResult.recovered),
+        partial_text: resumeResult.text,
+        cost: resumeResult.cost,
+        next_action: `Call agent_get_session_status with request_id="${request.request_id}" to poll.`,
+      };
+    }
+
+    case "agent_resume_session_async": {
+      if (!token) return { success: false, error: "No auth token available." };
+      const request = createAgentResumeRequest(String(args.agent_id), String(args.session_id), String(args.message));
+      updateAgentResumeRequest(request.request_id, { status: "running" });
+
+      void (async () => {
+        const startedAt = Date.now();
+        try {
+          const result = await executeResume(args);
+          if (result.status === "completed") {
+            updateAgentResumeRequest(request.request_id, {
+              status: "completed",
+              session_id: result.session_id,
+              previous_session_id: result.previous_session_id,
+              recovered: Boolean(result.recovered),
+              partial_text: result.text,
+              final_text: result.text,
+              cost: result.cost,
+              next_action: undefined,
+            });
+            return;
+          }
+
+          updateAgentResumeRequest(request.request_id, {
+            status: "still_running",
+            session_id: result.session_id,
+            previous_session_id: result.previous_session_id,
+            recovered: Boolean(result.recovered),
+            partial_text: result.text,
+            cost: result.cost,
+            next_action: "Call agent_get_session_status with this request_id to continue polling.",
+          });
+          const refreshed = agentResumeRequestsById.get(request.request_id);
+          if (refreshed) {
+            await pollResumeRequestUntilTerminal(refreshed, args, startedAt);
+          }
+        } catch (runError) {
+          updateAgentResumeRequest(request.request_id, {
+            status: "failed",
+            error: runError instanceof Error ? runError.message : String(runError),
+            next_action: undefined,
+          });
+        }
+      })();
+
+      return {
+        success: true,
+        request_id: request.request_id,
+        status: "running",
+        agent_id: request.agent_id,
+        session_id: request.session_id,
+        message: `Async resume started. Poll with agent_get_session_status(request_id="${request.request_id}").`,
+      };
+    }
+
+    case "agent_get_session_status": {
+      if (!token) return { success: false, error: "No auth token available." };
+      pruneAgentResumeStatusCache();
+      const request = agentResumeRequestsById.get(String(args.request_id));
+      if (!request) {
+        return {
+          success: false,
+          request_id: args.request_id,
+          error: "Request not found or expired.",
+        };
+      }
+      return {
+        success: true,
+        request_id: request.request_id,
+        status: request.status,
+        agent_id: request.agent_id,
+        session_id: request.session_id,
+        ...(request.previous_session_id ? { previous_session_id: request.previous_session_id } : {}),
+        recovered: Boolean(request.recovered),
+        partial_text: request.partial_text,
+        final_text: request.final_text,
+        cost: request.cost,
+        error: request.error,
+        next_action: request.next_action,
+        created_at: request.created_at,
+        updated_at: request.updated_at,
+      };
     }
 
     case "agent_delete_session": {
@@ -1772,11 +2775,44 @@ async function handleWalletTool(name: string, args: Record<string, any>, marketp
       );
       if (!response.ok) throw new Error(`Failed to get transactions: ${response.status} ${await response.text()}`);
       const txData = await response.json() as any;
-      // Compact transaction output
       const transactions = (txData.transactions || txData || []).slice(0, args.limit || 5);
+      const costView = String(args.cost_view || "summary").toLowerCase();
+
+      if (costView === "full") {
+        return {
+          transactions,
+          count: transactions.length,
+          ...(typeof txData.total === "number" ? { total: txData.total } : {}),
+          ...(typeof txData.hasMore === "boolean" ? { hasMore: txData.hasMore } : {}),
+        };
+      }
+
+      const byAgent: Record<string, { spend: number; tx_count: number; tool_calls: number }> = {};
+      let totalSpend = 0;
+      let totalToolCost = 0;
+      let totalToolCalls = 0;
+      for (const tx of transactions) {
+        const amount = Number(tx?.amount || 0);
+        const toolCost = Number(tx?.toolCost || 0);
+        const toolCalls = Number(tx?.toolCallCount || 0);
+        totalSpend += Number.isFinite(amount) ? amount : 0;
+        totalToolCost += Number.isFinite(toolCost) ? toolCost : 0;
+        totalToolCalls += Number.isFinite(toolCalls) ? toolCalls : 0;
+        const agentId = String(tx?.agentId || "unknown");
+        byAgent[agentId] = byAgent[agentId] || { spend: 0, tx_count: 0, tool_calls: 0 };
+        byAgent[agentId].spend += Number.isFinite(amount) ? amount : 0;
+        byAgent[agentId].tx_count += 1;
+        byAgent[agentId].tool_calls += Number.isFinite(toolCalls) ? toolCalls : 0;
+      }
+
       return {
-        transactions,
         count: transactions.length,
+        summary: {
+          total_spend: totalSpend,
+          total_tool_cost: totalToolCost,
+          total_tool_calls: totalToolCalls,
+          by_agent: byAgent,
+        },
         ...(typeof txData.total === "number" ? { total: txData.total } : {}),
         ...(typeof txData.hasMore === "boolean" ? { hasMore: txData.hasMore } : {}),
       };
@@ -1873,6 +2909,8 @@ setInterval(() => {
       sessions.delete(id);
     }
   }
+  pruneRunTailCache(now);
+  pruneAgentResumeStatusCache(now);
 }, 5 * 60 * 1000);
 
 function setupMCPHandlers(server: Server, marketplace: MarketplaceManager): void {
