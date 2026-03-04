@@ -284,8 +284,8 @@ export class MarketplaceManager {
     }
   }
 
-  /** Fetch the full tools/list from the gateway and extract tools matching a server prefix. */
-  private async fetchGatewayToolsForServer(serverPrefix: string): Promise<GatewayToolDefinition[]> {
+  /** Fetch ALL tools from the gateway's tools/list. */
+  private async fetchAllGatewayTools(): Promise<GatewayToolDefinition[]> {
     const token = this.currentUserToken;
     const body = { jsonrpc: "2.0", id: Date.now(), method: "tools/list", params: {} };
 
@@ -302,16 +302,28 @@ export class MarketplaceManager {
     if (!response.ok) return [];
 
     const data = await response.json() as any;
-    const allTools: GatewayToolDefinition[] = data.result?.tools ?? [];
+    return data.result?.tools ?? [];
+  }
 
-    // Match tools whose name starts with the server prefix (e.g. "io-github-brave-brave-search-mcp-server__")
-    return allTools
-      .filter(t => t.name.startsWith(`${serverPrefix}__`))
-      .map(t => ({
-        name: t.name.substring(serverPrefix.length + 2), // strip prefix
+  /** Extract gateway prefix and stripped tools from a list of prefixed tool names. */
+  private extractPrefixAndTools(tools: GatewayToolDefinition[]): { prefix: string; stripped: GatewayToolDefinition[] } {
+    if (tools.length === 0) return { prefix: "", stripped: [] };
+
+    // Derive prefix from first tool name (everything before first "__")
+    const firstToolName = tools[0].name;
+    const sepIndex = firstToolName.indexOf("__");
+    const prefix = sepIndex > 0 ? firstToolName.substring(0, sepIndex) : "";
+
+    const stripped = tools.map(t => {
+      const si = t.name.indexOf("__");
+      return {
+        name: si > 0 ? t.name.substring(si + 2) : t.name,
         description: t.description,
         inputSchema: t.inputSchema
-      }));
+      };
+    });
+
+    return { prefix, stripped };
   }
 
   private async notifyToolsChanged(): Promise<void> {
@@ -363,18 +375,30 @@ export class MarketplaceManager {
       };
     }
 
+    // Snapshot tools BEFORE enabling to diff later
+    const toolsBefore = await this.fetchAllGatewayTools();
+    const beforeNames = new Set(toolsBefore.map(t => t.name));
+
+    // Enable on the gateway
     const gatewayResult = await this.callGateway("gateway__enable_server", { server_id: serverId });
     const serverName: string = gatewayResult?.server?.name || gatewayResult?.server_name || gatewayResult?.name || serverId;
 
-    // The gateway enable response doesn't include tool definitions —
-    // fetch them from gateway tools/list using the server name as prefix
-    const namePrefix = serverName.replace(/[/.]/g, "-");
-    const tools: GatewayToolDefinition[] = await this.fetchGatewayToolsForServer(namePrefix);
+    // Discover new tools by diffing tools/list (retry up to 3 times for propagation)
+    let newGatewayTools: GatewayToolDefinition[] = [];
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) await new Promise(r => setTimeout(r, 1500));
+      const toolsAfter = await this.fetchAllGatewayTools();
+      newGatewayTools = toolsAfter.filter(t => !beforeNames.has(t.name));
+      if (newGatewayTools.length > 0) break;
+    }
+
+    // Extract the actual gateway prefix and strip it from tool names
+    const { prefix: gatewayPrefix, stripped: tools } = this.extractPrefixAndTools(newGatewayTools);
 
     this.enabledServers.set(serverId, {
       server_id: serverId,
       server_name: serverName,
-      gateway_prefix: namePrefix,
+      gateway_prefix: gatewayPrefix,
       tools,
       enabled_at: new Date().toISOString()
     });
@@ -386,6 +410,7 @@ export class MarketplaceManager {
       success: true,
       server_id: serverId,
       server_name: serverName,
+      gateway_prefix: gatewayPrefix,
       tools_added: tools.length,
       tools: tools.map(t => ({ name: `${serverId}__${t.name}`, description: t.description })),
       message: `Server "${serverName}" enabled. ${tools.length} tools added to session.`
