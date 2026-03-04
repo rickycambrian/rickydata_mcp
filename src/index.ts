@@ -58,7 +58,7 @@ Action formats:
 
 2. Add a node to an existing workflow:
 <action>
-{"action": "add_node", "message": "Added an agent node", "data": {"node": {"id": "node_3", "type": "agent", "position": {"x": 300, "y": 0}, "data": {"label": "My Agent", "model": "sonnet"}}, "connections": [{"source": "node_2", "target": "node_3"}]}}
+{"action": "add_node", "message": "Added an agent node", "data": {"node": {"id": "node_3", "type": "agent", "position": {"x": 300, "y": 0}, "data": {"label": "My Agent", "model": "claude-sonnet-4-6"}}, "connections": [{"source": "node_2", "target": "node_3"}]}}
 </action>
 
 3. Connect two nodes:
@@ -92,6 +92,27 @@ function truncateResponse(data: any): any {
   if (text.length <= RESPONSE_MAX_LENGTH) return data;
   // For large responses, return as truncated string to avoid broken JSON
   return text.slice(0, RESPONSE_MAX_LENGTH) + `\n... [truncated at ${RESPONSE_MAX_LENGTH} chars of ${text.length} total]`;
+}
+
+// Model shorthand → full ID mapping (canvas runtime requires full IDs)
+const MODEL_NAME_MAP: Record<string, string> = {
+  sonnet: "claude-sonnet-4-6",
+  haiku: "claude-haiku-4-5-20251001",
+  opus: "claude-opus-4-6",
+};
+
+function normalizeModelName(name: string): string {
+  return MODEL_NAME_MAP[name?.toLowerCase()] || name;
+}
+
+/** Normalize model names in workflow nodes before execution. */
+function normalizeWorkflowNodes(nodes: any[]): any[] {
+  return nodes.map(n => {
+    if (n.data?.model) {
+      return { ...n, data: { ...n.data, model: normalizeModelName(n.data.model) } };
+    }
+    return n;
+  });
 }
 
 // ============================================================================
@@ -305,7 +326,12 @@ const AGENT_TOOLS = [
   {
     name: "agent_list",
     description: "List available agents from the Agent Gateway.",
-    inputSchema: { type: "object", properties: {} }
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "number", description: "Max agents to return (default: 10)" }
+      }
+    }
   },
   {
     name: "agent_create_session",
@@ -351,7 +377,8 @@ const AGENT_TOOLS = [
       type: "object",
       properties: {
         agent_id: { type: "string", description: "Agent ID" },
-        session_id: { type: "string", description: "Session ID" }
+        session_id: { type: "string", description: "Session ID" },
+        message_limit: { type: "number", description: "Max messages to return (default: 10, use 0 for all)" }
       },
       required: ["agent_id", "session_id"]
     }
@@ -451,7 +478,7 @@ const WALLET_TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        limit: { type: "number", description: "Max results (default: 20)" }
+        limit: { type: "number", description: "Max results (default: 5)" }
       }
     }
   },
@@ -511,9 +538,10 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
   switch (name) {
     case "canvas_execute_workflow": {
       // Synchronous execution via SSE streaming — collect all events and return final result
+      const execArgs = { ...args, nodes: normalizeWorkflowNodes(args.nodes || []), connections: args.connections || [] };
       const response = await fetchWithTimeout(
         `${CANVAS_API_URL}/canvas/workflows/execute/stream`,
-        { method: "POST", headers, body: JSON.stringify(args) },
+        { method: "POST", headers, body: JSON.stringify(execArgs) },
         300000
       );
       if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
@@ -523,9 +551,10 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
 
     case "canvas_execute_workflow_async": {
       // Async execution via SSE — return run ID immediately after run_started event
+      const execArgs = { ...args, nodes: normalizeWorkflowNodes(args.nodes || []), connections: args.connections || [] };
       const response = await fetchWithTimeout(
         `${CANVAS_API_URL}/canvas/workflows/execute/stream`,
-        { method: "POST", headers, body: JSON.stringify(args) },
+        { method: "POST", headers, body: JSON.stringify(execArgs) },
         300000
       );
       if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
@@ -558,10 +587,13 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
     }
 
     case "canvas_save_workflow": {
+      // Normalize model names in nodes before saving
+      const saveArgs = { ...args };
+      if (Array.isArray(saveArgs.nodes)) saveArgs.nodes = normalizeWorkflowNodes(saveArgs.nodes);
       const response = await fetchWithTimeout(
         `${CANVAS_API_URL}/canvas/workflows`,
-        { method: "POST", headers, body: JSON.stringify(args) },
-        15000
+        { method: "POST", headers, body: JSON.stringify(saveArgs) },
+        60000
       );
       if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
       return await response.json();
@@ -570,14 +602,33 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
     case "canvas_get_workflows": {
       const params = new URLSearchParams();
       if (args.search) params.append("search", args.search);
-      if (args.limit) params.append("limit", String(args.limit));
+      const requestedLimit = args.limit || 10;
       const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/canvas/workflows?${params}`,
+        `${CANVAS_API_URL}/canvas/workflows`,
         { headers },
-        15000
+        30000
       );
       if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
-      return await response.json();
+      const wfData = await response.json() as any;
+      let workflows = wfData.workflows || [];
+      // Client-side search filtering (gateway may not support search param)
+      if (args.search) {
+        const q = args.search.toLowerCase();
+        workflows = workflows.filter((w: any) =>
+          (w.name || "").toLowerCase().includes(q) || (w.description || "").toLowerCase().includes(q)
+        );
+      }
+      // Apply limit
+      workflows = workflows.slice(0, requestedLimit);
+      // Strip verbose fields for compact output
+      const compact = workflows.map((w: any) => ({
+        entityId: w.entityId,
+        name: w.name,
+        description: w.description || "",
+        createdAt: w.createdAt,
+        nodeCount: (() => { try { return (typeof w.nodesJson === "string" ? JSON.parse(w.nodesJson) : w.nodes || []).length; } catch { return 0; } })(),
+      }));
+      return { workflows: compact, count: compact.length, total: (wfData.workflows || []).length };
     }
 
     case "run_saved_canvas_workflow": {
@@ -585,7 +636,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       const wfResponse = await fetchWithTimeout(
         `${CANVAS_API_URL}/canvas/workflows`,
         { headers },
-        15000
+        30000
       );
       if (!wfResponse.ok) throw new Error(`Failed to load workflows: ${await wfResponse.text()}`);
       const wfData = await wfResponse.json() as any;
@@ -606,7 +657,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       }
       if (!Array.isArray(nodes) || nodes.length === 0) throw new Error(`Workflow "${searchTerm}" has no nodes`);
       const request: Record<string, any> = {
-        nodes: nodes.map((n: any) => ({ id: n.id, type: n.type, data: n.data })),
+        nodes: normalizeWorkflowNodes(nodes.map((n: any) => ({ id: n.id, type: n.type, data: n.data }))),
         connections: (Array.isArray(edges) ? edges : []).map((e: any) => ({ source: e.source, target: e.target })),
         ...(args.inputs ? { inputs: args.inputs } : {})
       };
@@ -626,7 +677,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       const wfResponse = await fetchWithTimeout(
         `${CANVAS_API_URL}/canvas/workflows`,
         { headers },
-        15000
+        30000
       );
       if (!wfResponse.ok) throw new Error(`Failed to load workflows: ${await wfResponse.text()}`);
       const wfData = await wfResponse.json() as any;
@@ -647,7 +698,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       }
       if (!Array.isArray(nodes) || nodes.length === 0) throw new Error(`Workflow "${searchTerm}" has no nodes`);
       const request: Record<string, any> = {
-        nodes: nodes.map((n: any) => ({ id: n.id, type: n.type, data: n.data })),
+        nodes: normalizeWorkflowNodes(nodes.map((n: any) => ({ id: n.id, type: n.type, data: n.data }))),
         connections: (Array.isArray(edges) ? edges : []).map((e: any) => ({ source: e.source, target: e.target })),
         ...(args.inputs ? { inputs: args.inputs } : {})
       };
@@ -801,17 +852,20 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
     }
 
     case "update_canvas_workflow": {
-      // Fetch → merge → save as new version
-      const wfResponse = await fetchWithTimeout(
-        `${CANVAS_API_URL}/canvas/workflows`,
-        { headers },
-        15000
-      );
-      if (!wfResponse.ok) throw new Error(`Failed to load workflows: ${await wfResponse.text()}`);
-      const wfData = await wfResponse.json() as any;
-      const workflows = wfData.workflows || [];
-      const wf = workflows.find((w: any) => w.entityId === args.workflow_id || w.name === args.workflow_id);
-      if (!wf) throw new Error(`Workflow "${args.workflow_id}" not found`);
+      // Fetch → merge → save as new version (with retry for Geo propagation delay)
+      const findWorkflow = async (): Promise<any> => {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const wfResponse = await fetchWithTimeout(`${CANVAS_API_URL}/canvas/workflows`, { headers }, 30000);
+          if (!wfResponse.ok) throw new Error(`Failed to load workflows: ${await wfResponse.text()}`);
+          const wfData = await wfResponse.json() as any;
+          const workflows = wfData.workflows || [];
+          const wf = workflows.find((w: any) => w.entityId === args.workflow_id || w.name === args.workflow_id);
+          if (wf) return wf;
+          if (attempt === 0) await new Promise(r => setTimeout(r, 3000)); // wait for Geo propagation
+        }
+        throw new Error(`Workflow "${args.workflow_id}" not found. If recently saved, try again in a few seconds.`);
+      };
+      const wf = await findWorkflow();
 
       let existingNodes: any[], existingEdges: any[];
       try {
@@ -821,17 +875,18 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
         throw new Error("Workflow nodes/edges JSON is corrupted: " + (e as Error).message);
       }
 
+      const updatedNodes = args.nodes ? normalizeWorkflowNodes(args.nodes) : existingNodes;
       const savePayload: Record<string, any> = {
         name: args.name || wf.name,
         description: args.description !== undefined ? args.description : (wf.description || ""),
-        nodes: args.nodes || existingNodes,
+        nodes: updatedNodes,
         connections: args.connections || existingEdges.map((e: any) => ({ source: e.source, target: e.target }))
       };
 
       const saveResponse = await fetchWithTimeout(
         `${CANVAS_API_URL}/canvas/workflows`,
         { method: "POST", headers, body: JSON.stringify(savePayload) },
-        15000
+        60000
       );
       if (!saveResponse.ok) throw new Error(`Failed to save workflow: ${await saveResponse.text()}`);
       const saved = await saveResponse.json() as any;
@@ -846,17 +901,20 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
     }
 
     case "update_workflow_node": {
-      // Fetch → modify single node → save as new version
-      const wfResponse = await fetchWithTimeout(
-        `${CANVAS_API_URL}/canvas/workflows`,
-        { headers },
-        15000
-      );
-      if (!wfResponse.ok) throw new Error(`Failed to load workflows: ${await wfResponse.text()}`);
-      const wfData = await wfResponse.json() as any;
-      const workflows = wfData.workflows || [];
-      const wf = workflows.find((w: any) => w.entityId === args.workflow_id || w.name === args.workflow_id);
-      if (!wf) throw new Error(`Workflow "${args.workflow_id}" not found`);
+      // Fetch → modify single node → save as new version (with retry for Geo propagation)
+      const findWf = async (): Promise<any> => {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const wfResponse = await fetchWithTimeout(`${CANVAS_API_URL}/canvas/workflows`, { headers }, 30000);
+          if (!wfResponse.ok) throw new Error(`Failed to load workflows: ${await wfResponse.text()}`);
+          const wfData = await wfResponse.json() as any;
+          const workflows = wfData.workflows || [];
+          const wf = workflows.find((w: any) => w.entityId === args.workflow_id || w.name === args.workflow_id);
+          if (wf) return wf;
+          if (attempt === 0) await new Promise(r => setTimeout(r, 3000)); // wait for Geo propagation
+        }
+        throw new Error(`Workflow "${args.workflow_id}" not found. If recently saved, try again in a few seconds.`);
+      };
+      const wf = await findWf();
 
       let nodes: any[], edges: any[];
       try {
@@ -872,7 +930,11 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       // Apply updates
       if (args.type) targetNode.type = args.type;
       if (args.position) targetNode.position = args.position;
-      if (args.data) targetNode.data = { ...targetNode.data, ...args.data };
+      if (args.data) {
+        targetNode.data = { ...targetNode.data, ...args.data };
+        // Normalize model name if updated
+        if (targetNode.data.model) targetNode.data.model = normalizeModelName(targetNode.data.model);
+      }
 
       const savePayload = {
         name: wf.name,
@@ -884,7 +946,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       const saveResponse = await fetchWithTimeout(
         `${CANVAS_API_URL}/canvas/workflows`,
         { method: "POST", headers, body: JSON.stringify(savePayload) },
-        15000
+        60000
       );
       if (!saveResponse.ok) throw new Error(`Failed to save workflow: ${await saveResponse.text()}`);
       const saved = await saveResponse.json() as any;
@@ -959,7 +1021,16 @@ async function handleAgentTool(name: string, args: Record<string, any>, marketpl
       );
       if (!response.ok) throw new Error(`Agent Gateway returned ${response.status}: ${await response.text()}`);
       const data = await response.json() as any;
-      return { success: true, agents: data.agents || [], count: (data.agents || []).length };
+      const allAgents = data.agents || [];
+      const limit = args.limit || 10;
+      const agents = allAgents.slice(0, limit).map((a: any) => ({
+        id: a.id,
+        name: a.name,
+        description: (a.description || "").slice(0, 120),
+        model: a.model,
+        requiredSecrets: a.requiredSecrets,
+      }));
+      return { success: true, agents, count: agents.length, total: allAgents.length };
     }
 
     case "agent_create_session": {
@@ -1072,6 +1143,24 @@ async function handleAgentTool(name: string, args: Record<string, any>, marketpl
       );
       if (!response.ok) throw new Error(`Failed to get session: ${response.status} ${await response.text()}`);
       const data = await response.json() as any;
+      // Limit messages to avoid huge outputs
+      const msgLimit = args.message_limit !== undefined ? args.message_limit : 10;
+      if (msgLimit > 0 && Array.isArray(data.messages) && data.messages.length > msgLimit) {
+        const totalMessages = data.messages.length;
+        data.messages = data.messages.slice(-msgLimit); // keep most recent
+        data.messages_truncated = true;
+        data.total_messages = totalMessages;
+        data.showing_last = msgLimit;
+      }
+      // Compact message content (truncate long text blocks)
+      if (Array.isArray(data.messages)) {
+        data.messages = data.messages.map((m: any) => {
+          if (typeof m.content === "string" && m.content.length > 500) {
+            return { ...m, content: m.content.slice(0, 500) + "... [truncated]" };
+          }
+          return m;
+        });
+      }
       return { success: true, ...data };
     }
 
@@ -1091,25 +1180,45 @@ async function handleAgentTool(name: string, args: Record<string, any>, marketpl
       const responseText = await chatResponse.text();
       let accumulatedText = "";
       let cost: string | undefined;
-      for (const line of responseText.split("\n")) {
-        if (!line.startsWith("data: ") && !line.startsWith("data:")) continue;
-        const dataStr = line.startsWith("data: ") ? line.slice(6) : line.slice(5);
-        if (dataStr === "[DONE]") break;
-        try {
-          const event = JSON.parse(dataStr) as any;
-          if (event.type === "text") {
-            if (typeof event.data === "string") accumulatedText += event.data;
-            else if (event.data?.text) accumulatedText += event.data.text;
+
+      // Check if response is SSE format or plain JSON
+      const isSSE = responseText.includes("data: ") || responseText.includes("data:");
+      if (isSSE) {
+        for (const line of responseText.split("\n")) {
+          if (!line.startsWith("data: ") && !line.startsWith("data:")) continue;
+          const dataStr = line.startsWith("data: ") ? line.slice(6) : line.slice(5);
+          if (dataStr === "[DONE]") break;
+          try {
+            const event = JSON.parse(dataStr) as any;
+            if (event.type === "text") {
+              if (typeof event.data === "string") accumulatedText += event.data;
+              else if (event.data?.text) accumulatedText += event.data.text;
+            }
+            if (event.type === "content_block_delta" && event.delta?.text) accumulatedText += event.delta.text;
+            if (event.type === "done" && event.data?.cost) cost = event.data.cost;
+            if (event.type === "usage" && event.data?.cost) cost = event.data.cost;
+            if (event.type === "error") throw new Error(`Agent error: ${event.data?.message || JSON.stringify(event.data)}`);
+          } catch (e) {
+            if (e instanceof Error && e.message.startsWith("Agent error:")) throw e;
+            console.error("[sse] Dropped malformed SSE line:", dataStr?.slice(0, 200));
           }
-          if (event.type === "content_block_delta" && event.delta?.text) accumulatedText += event.delta.text;
-          if (event.type === "done" && event.data?.cost) cost = event.data.cost;
-          if (event.type === "usage" && event.data?.cost) cost = event.data.cost;
-          if (event.type === "error") throw new Error(`Agent error: ${event.data?.message || JSON.stringify(event.data)}`);
-        } catch (e) {
-          if (e instanceof Error && e.message.startsWith("Agent error:")) throw e;
-          console.error("[sse] Dropped malformed SSE line:", dataStr?.slice(0, 200));
+        }
+      } else {
+        // Fallback: try parsing as JSON response
+        try {
+          const jsonResp = JSON.parse(responseText) as any;
+          accumulatedText = jsonResp.text || jsonResp.response || jsonResp.content || responseText;
+          cost = jsonResp.cost;
+        } catch {
+          accumulatedText = responseText; // raw text fallback
         }
       }
+
+      if (!accumulatedText && responseText.length > 0) {
+        // Last resort: return raw response info for debugging
+        accumulatedText = `[No text extracted from response. Raw length: ${responseText.length}, starts with: ${responseText.slice(0, 100)}]`;
+      }
+
       return { success: true, agent_id, session_id, text: accumulatedText, cost, message: `Session "${session_id}" resumed.` };
     }
 
@@ -1151,7 +1260,19 @@ async function handleA2ATool(name: string, args: Record<string, any>, marketplac
         15000
       );
       if (!response.ok) throw new Error(`Failed to get agent card: ${response.status} ${await response.text()}`);
-      return await response.json();
+      const card = await response.json() as any;
+      // Compact: truncate skills list to avoid massive output
+      if (Array.isArray(card.skills) && card.skills.length > 5) {
+        const totalSkills = card.skills.length;
+        card.skills = card.skills.slice(0, 5);
+        card.skills_truncated = true;
+        card.total_skills = totalSkills;
+      }
+      // Strip verbose capability details
+      if (card.capabilities) {
+        card.capabilities = Object.keys(card.capabilities);
+      }
+      return card;
     }
 
     case "a2a_send_message": {
@@ -1237,19 +1358,30 @@ async function handleWalletTool(name: string, args: Record<string, any>, marketp
         15000
       );
       if (!response.ok) throw new Error(`Failed to get balance: ${response.status} ${await response.text()}`);
-      return await response.json();
+      const balance = await response.json() as any;
+      // Return compact summary — strip per-agent breakdowns
+      return {
+        walletAddress: balance.walletAddress || balance.address,
+        usdc: balance.usdc || balance.usdcBalance,
+        eth: balance.eth || balance.ethBalance,
+        network: balance.network || "base",
+        ...(balance.totalSpent ? { totalSpent: balance.totalSpent } : {}),
+      };
     }
 
     case "wallet_get_transactions": {
       const params = new URLSearchParams();
-      if (args.limit) params.append("limit", String(args.limit));
+      params.append("limit", String(args.limit || 5));
       const response = await fetchWithTimeout(
         `${AGENT_GATEWAY_URL}/wallet/transactions?${params}`,
         { headers },
         15000
       );
       if (!response.ok) throw new Error(`Failed to get transactions: ${response.status} ${await response.text()}`);
-      return await response.json();
+      const txData = await response.json() as any;
+      // Compact transaction output
+      const transactions = (txData.transactions || txData || []).slice(0, args.limit || 5);
+      return { transactions, count: transactions.length };
     }
 
     case "wallet_apikey_status": {
