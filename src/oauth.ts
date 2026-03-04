@@ -26,7 +26,21 @@ import type {
   OAuthTokenRevocationRequest,
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { verifyWalletToken } from "./wallet-token.js";
+import { verifyWalletToken, WALLET_TOKEN_PREFIX } from "./wallet-token.js";
+
+/**
+ * Extract expiry (seconds since epoch) from a wallet token payload.
+ * Token format: mcpwt_<base64url(JSON)> where JSON has { exp: number }.
+ */
+function getTokenExpiry(token: string): number | undefined {
+  try {
+    const json = Buffer.from(token.slice(WALLET_TOKEN_PREFIX.length), "base64url").toString();
+    const payload = JSON.parse(json);
+    return typeof payload.exp === "number" ? payload.exp : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 // ============================================================================
 // Configuration
@@ -279,10 +293,14 @@ export class RickydataOAuthProvider implements OAuthServerProvider {
       throw new Error("Invalid or expired wallet token");
     }
 
+    // requireBearerAuth requires expiresAt — extract from token payload
+    const expiresAt = getTokenExpiry(token);
+
     return {
       token,
       clientId: "wallet",
       scopes: [],
+      expiresAt,
       extra: { walletAddress: result.walletAddress },
     };
   }
