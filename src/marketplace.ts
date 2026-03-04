@@ -360,6 +360,32 @@ export class MarketplaceManager {
     return await this.callGateway("gateway__server_info", { server_id: args.server_id });
   }
 
+  /** Derive the gateway tool prefix from a server name (e.g. "KnowAir Weather MCP" → "knowair-weather-mcp"). */
+  private deriveGatewayPrefix(serverName: string): string {
+    return serverName.toLowerCase().replace(/[/._\s]+/g, "-");
+  }
+
+  /** Resolve a server_id (name or UUID) to a gateway UUID and display name. */
+  private async resolveServerId(serverId: string): Promise<{ uuid: string; name: string } | null> {
+    const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(serverId);
+    if (isUUID) return { uuid: serverId, name: serverId };
+
+    // Search marketplace to resolve name → UUID
+    const searchResult = await this.callGateway("gateway__search_servers", { query: serverId });
+    const servers: any[] = searchResult?.servers || [];
+    if (servers.length === 0) return null;
+
+    const lowerInput = serverId.toLowerCase();
+    const match = servers.find((s: any) =>
+      s.name?.toLowerCase() === lowerInput ||
+      s.title?.toLowerCase() === lowerInput ||
+      this.deriveGatewayPrefix(s.name || "") === lowerInput
+    );
+
+    const selected = match || servers[0];
+    return { uuid: selected.id, name: selected.name || selected.title || serverId };
+  }
+
   async handleEnableServer(args: { server_id: string }): Promise<any> {
     const serverId = args.server_id;
 
@@ -375,25 +401,40 @@ export class MarketplaceManager {
       };
     }
 
-    // Snapshot tools BEFORE enabling to diff later
-    const toolsBefore = await this.fetchAllGatewayTools();
-    const beforeNames = new Set(toolsBefore.map(t => t.name));
-
-    // Enable on the gateway
-    const gatewayResult = await this.callGateway("gateway__enable_server", { server_id: serverId });
-    const serverName: string = gatewayResult?.server?.name || gatewayResult?.server_name || gatewayResult?.name || serverId;
-
-    // Discover new tools by diffing tools/list (retry up to 3 times for propagation)
-    let newGatewayTools: GatewayToolDefinition[] = [];
-    for (let attempt = 0; attempt < 3; attempt++) {
-      if (attempt > 0) await new Promise(r => setTimeout(r, 1500));
-      const toolsAfter = await this.fetchAllGatewayTools();
-      newGatewayTools = toolsAfter.filter(t => !beforeNames.has(t.name));
-      if (newGatewayTools.length > 0) break;
+    // Resolve server_id to UUID (gateway only accepts UUIDs)
+    const resolved = await this.resolveServerId(serverId);
+    if (!resolved) {
+      return { success: false, error: `Server "${serverId}" not found in marketplace.` };
     }
 
-    // Extract the actual gateway prefix and strip it from tool names
-    const { prefix: gatewayPrefix, stripped: tools } = this.extractPrefixAndTools(newGatewayTools);
+    // Enable on the gateway
+    const gatewayResult = await this.callGateway("gateway__enable_server", { server_id: resolved.uuid });
+
+    // Check for enable errors
+    if (typeof gatewayResult === "string" && gatewayResult.toLowerCase().includes("not found")) {
+      return { success: false, error: gatewayResult };
+    }
+
+    const serverName: string = gatewayResult?.server?.name || gatewayResult?.server_name || gatewayResult?.name || resolved.name;
+
+    // Derive gateway prefix and fetch matching tools from tools/list
+    const gatewayPrefix = this.deriveGatewayPrefix(serverName);
+    let tools: GatewayToolDefinition[] = [];
+
+    // Retry up to 3 times (tools may take a moment to appear after enable)
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) await new Promise(r => setTimeout(r, 1500));
+      const allTools = await this.fetchAllGatewayTools();
+      const matching = allTools.filter(t => t.name.startsWith(`${gatewayPrefix}__`));
+      if (matching.length > 0) {
+        tools = matching.map(t => ({
+          name: t.name.substring(gatewayPrefix.length + 2),
+          description: t.description,
+          inputSchema: t.inputSchema
+        }));
+        break;
+      }
+    }
 
     this.enabledServers.set(serverId, {
       server_id: serverId,
@@ -431,8 +472,10 @@ export class MarketplaceManager {
     const serverInfo = this.enabledServers.get(serverId)!;
     const removedToolCount = serverInfo.tools.length;
 
+    // Resolve to UUID for the gateway call
+    const resolved = await this.resolveServerId(serverId);
     try {
-      await this.callGateway("gateway__disable_server", { server_id: serverId });
+      await this.callGateway("gateway__disable_server", { server_id: resolved?.uuid || serverId });
     } catch (err) {
       console.error(`[marketplace] Gateway disable error for ${serverId}:`, err);
     }
