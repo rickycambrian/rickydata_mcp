@@ -24,7 +24,27 @@ interface EnabledServer {
   enabled_at: string;
 }
 
+interface RelayInfo {
+  mode?: string;
+  payerAddress?: string;
+  requiredBaseUnits?: string;
+  availableBaseUnits?: string;
+  topUpUrl?: string;
+}
+
+class GatewayPaymentRequiredError extends Error {
+  relay?: RelayInfo;
+
+  constructor(message: string, relay?: RelayInfo) {
+    super(message);
+    this.name = "GatewayPaymentRequiredError";
+    this.relay = relay;
+  }
+}
+
 const GATEWAY_URL = "https://mcp.rickydata.org/mcp";
+const MCP_DISABLE_TIMEOUTS = process.env.MCP_DISABLE_TIMEOUTS !== "false";
+const MCP_HTTP_TIMEOUT_MS = parseInt(process.env.MCP_HTTP_TIMEOUT_MS || "0", 10);
 
 export const MARKETPLACE_TOOLS = [
   {
@@ -105,6 +125,32 @@ export class MarketplaceManager {
     return this.currentUserToken;
   }
 
+  private baseUnitsToUsd(value?: string): string {
+    if (!value || !/^\d+$/.test(value)) return "unknown";
+    const n = BigInt(value);
+    const intPart = n / 1_000_000n;
+    const fracPart = (n % 1_000_000n).toString().padStart(6, "0");
+    return `${intPart}.${fracPart}`;
+  }
+
+  private buildPaymentRequiredMessage(paymentData: Record<string, any>): string {
+    const relay = (paymentData.relay && typeof paymentData.relay === "object")
+      ? (paymentData.relay as RelayInfo)
+      : undefined;
+    if (relay?.mode === "managed") {
+      const requiredUsd = this.baseUnitsToUsd(relay.requiredBaseUnits);
+      const availableUsd = this.baseUnitsToUsd(relay.availableBaseUnits);
+      const topUpUrl = relay.topUpUrl || "https://mcpmarketplace.rickydata.org/#/wallet";
+      return [
+        "Payment required: managed relay balance is insufficient.",
+        `Managed payer: ${relay.payerAddress || "unknown"}`,
+        `Required: $${requiredUsd} USDC, available: $${availableUsd} USDC`,
+        `Top up wallet: ${topUpUrl}`,
+      ].join(" ");
+    }
+    return "Payment required. Please fund your wallet on Base mainnet and retry.";
+  }
+
   private async callGateway(toolName: string, args: Record<string, any>): Promise<any> {
     const token = this.currentUserToken;
 
@@ -115,8 +161,10 @@ export class MarketplaceManager {
       params: { name: toolName, arguments: args }
     };
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30000);
+    const shouldUseTimeout = !MCP_DISABLE_TIMEOUTS;
+    const effectiveTimeoutMs = Number.isFinite(MCP_HTTP_TIMEOUT_MS) && MCP_HTTP_TIMEOUT_MS > 0 ? MCP_HTTP_TIMEOUT_MS : 30000;
+    const controller = shouldUseTimeout ? new AbortController() : null;
+    const timeout = shouldUseTimeout ? setTimeout(() => controller!.abort(), effectiveTimeoutMs) : null;
 
     try {
       const response = await fetch(GATEWAY_URL, {
@@ -127,8 +175,14 @@ export class MarketplaceManager {
           ...(token ? { "Authorization": `Bearer ${token}` } : {})
         },
         body: JSON.stringify(body),
-        signal: controller.signal
+        ...(controller ? { signal: controller.signal } : {})
       });
+
+      if (response.status === 402) {
+        const paymentData = await response.json().catch(() => ({} as Record<string, any>)) as Record<string, any>;
+        const message = this.buildPaymentRequiredMessage(paymentData);
+        throw new GatewayPaymentRequiredError(message, paymentData.relay as RelayInfo | undefined);
+      }
 
       if (!response.ok) {
         const errorText = await response.text();
@@ -146,8 +200,17 @@ export class MarketplaceManager {
         const textContent = result.content.find((c: any) => c.type === "text");
         if (textContent?.text) {
           try {
-            return JSON.parse(textContent.text);
-          } catch {
+            const parsed = JSON.parse(textContent.text);
+            if (parsed?.error === "PAYMENT_REQUIRED") {
+              const paymentReqs = parsed?.paymentRequirements ?? {};
+              const message = this.buildPaymentRequiredMessage(paymentReqs);
+              throw new GatewayPaymentRequiredError(message, paymentReqs?.relay);
+            }
+            return parsed;
+          } catch (err) {
+            if (err instanceof GatewayPaymentRequiredError) {
+              throw err;
+            }
             return textContent.text;
           }
         }
@@ -155,7 +218,7 @@ export class MarketplaceManager {
       }
       return result;
     } finally {
-      clearTimeout(timeout);
+      if (timeout) clearTimeout(timeout);
     }
   }
 

@@ -16,6 +16,50 @@ import { MarketplaceManager, MARKETPLACE_TOOLS } from "./marketplace.js";
 const RESPONSE_MAX_LENGTH = parseInt(process.env.RESPONSE_MAX_LENGTH || "200000", 10);
 const CANVAS_API_URL = process.env.CANVAS_API_URL || "https://agents.rickydata.org";
 const AGENT_GATEWAY_URL = process.env.AGENT_GATEWAY_URL || "https://agents.rickydata.org";
+const MCP_DISABLE_TIMEOUTS = process.env.MCP_DISABLE_TIMEOUTS !== "false";
+const MCP_HTTP_TIMEOUT_MS = parseInt(process.env.MCP_HTTP_TIMEOUT_MS || "0", 10);
+const WORKFLOW_CACHE_TTL_MS = parseInt(process.env.WORKFLOW_CACHE_TTL_MS || "900000", 10);
+const WORKFLOW_LOOKUP_LIMIT = parseInt(process.env.WORKFLOW_LOOKUP_LIMIT || "100", 10);
+
+interface WorkflowLike {
+  entityId?: string;
+  workflowId?: string;
+  id?: string;
+  name?: string;
+  description?: string;
+  nodesJson?: string;
+  edgesJson?: string;
+  nodes?: any[];
+  edges?: any[];
+  createdAt?: string;
+  updatedAt?: string;
+  [key: string]: any;
+}
+
+interface WorkflowCacheEntry {
+  workflow: WorkflowLike;
+  cachedAt: number;
+}
+
+interface ParsedSSEOptions {
+  includeEvents?: boolean;
+  includeLiveLogs?: boolean;
+  liveLogLimit?: number;
+  streamProgress?: boolean;
+}
+
+interface ParsedSSEResult {
+  runId: string;
+  status: string;
+  results: Record<string, any>;
+  logs: string[];
+  event_count: number;
+  error?: string;
+  events?: any[];
+}
+
+const workflowCacheById = new Map<string, WorkflowCacheEntry>();
+const workflowCacheByName = new Map<string, WorkflowCacheEntry>();
 
 // ============================================================================
 // NODE TYPE CATALOG (static reference for canvas_get_available_tools)
@@ -77,9 +121,21 @@ Always include a human-readable "message" explaining what you did. Position node
 // HELPERS
 // ============================================================================
 
-async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: number): Promise<Response> {
+function resolveTimeoutMs(requestedMs?: number): number | undefined {
+  if (MCP_DISABLE_TIMEOUTS) return undefined;
+  if (Number.isFinite(requestedMs) && (requestedMs as number) > 0) return requestedMs;
+  if (Number.isFinite(MCP_HTTP_TIMEOUT_MS) && MCP_HTTP_TIMEOUT_MS > 0) return MCP_HTTP_TIMEOUT_MS;
+  return undefined;
+}
+
+async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs?: number): Promise<Response> {
+  const effectiveTimeoutMs = resolveTimeoutMs(timeoutMs);
+  if (!effectiveTimeoutMs) {
+    return await fetch(url, options);
+  }
+
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const timeout = setTimeout(() => controller.abort(), effectiveTimeoutMs);
   try {
     return await fetch(url, { ...options, signal: controller.signal });
   } finally {
@@ -94,25 +150,184 @@ function truncateResponse(data: any): any {
   return text.slice(0, RESPONSE_MAX_LENGTH) + `\n... [truncated at ${RESPONSE_MAX_LENGTH} chars of ${text.length} total]`;
 }
 
-// Model shorthand → full ID mapping (canvas runtime requires full IDs)
-const MODEL_NAME_MAP: Record<string, string> = {
+// Canvas runtime expects full model IDs for workflow agent nodes.
+const CANVAS_MODEL_NAME_MAP: Record<string, string> = {
   sonnet: "claude-sonnet-4-6",
   haiku: "claude-haiku-4-5-20251001",
   opus: "claude-opus-4-6",
 };
 
-function normalizeModelName(name: string): string {
-  return MODEL_NAME_MAP[name?.toLowerCase()] || name;
+// Agent Gateway chat/session endpoints are alias-first; normalize full IDs to aliases.
+const GATEWAY_MODEL_NAME_MAP: Record<string, string> = {
+  sonnet: "sonnet",
+  "claude-sonnet-4-6": "sonnet",
+  haiku: "haiku",
+  "claude-haiku-4-5-20251001": "haiku",
+  opus: "opus",
+  "claude-opus-4-6": "opus",
+};
+
+function normalizeCanvasModelName(name?: string): string | undefined {
+  if (!name) return undefined;
+  return CANVAS_MODEL_NAME_MAP[name.toLowerCase()] || name;
+}
+
+function normalizeGatewayModelName(name?: string, fallback = "haiku"): string {
+  if (!name) return fallback;
+  return GATEWAY_MODEL_NAME_MAP[name.toLowerCase()] || name;
 }
 
 /** Normalize model names in workflow nodes before execution. */
 function normalizeWorkflowNodes(nodes: any[]): any[] {
   return nodes.map(n => {
     if (n.data?.model) {
-      return { ...n, data: { ...n.data, model: normalizeModelName(n.data.model) } };
+      return { ...n, data: { ...n.data, model: normalizeCanvasModelName(n.data.model) } };
     }
     return n;
   });
+}
+
+function getWorkflowId(workflow: WorkflowLike): string | undefined {
+  const direct = typeof workflow.entityId === "string"
+    ? workflow.entityId
+    : typeof workflow.workflowId === "string"
+      ? workflow.workflowId
+      : typeof workflow.id === "string"
+        ? workflow.id
+        : undefined;
+  if (direct) return direct;
+  const nested = workflow.workflow;
+  if (nested && typeof nested === "object") {
+    if (typeof nested.entityId === "string") return nested.entityId;
+    if (typeof nested.workflowId === "string") return nested.workflowId;
+    if (typeof nested.id === "string") return nested.id;
+  }
+  return undefined;
+}
+
+function normalizeWorkflowForCache(workflow: WorkflowLike): WorkflowLike {
+  const normalized: WorkflowLike = { ...workflow };
+  if (!normalized.entityId) {
+    const id = getWorkflowId(normalized);
+    if (id) normalized.entityId = id;
+  }
+  return normalized;
+}
+
+function pruneWorkflowCache(now = Date.now()): void {
+  for (const [id, entry] of workflowCacheById.entries()) {
+    if (now - entry.cachedAt > WORKFLOW_CACHE_TTL_MS) workflowCacheById.delete(id);
+  }
+  for (const [name, entry] of workflowCacheByName.entries()) {
+    if (now - entry.cachedAt > WORKFLOW_CACHE_TTL_MS) workflowCacheByName.delete(name);
+  }
+}
+
+function cacheWorkflow(workflow: WorkflowLike): void {
+  const normalized = normalizeWorkflowForCache(workflow);
+  const entry: WorkflowCacheEntry = {
+    workflow: normalized,
+    cachedAt: Date.now(),
+  };
+  const id = getWorkflowId(normalized);
+  if (id) workflowCacheById.set(id, entry);
+  if (typeof normalized.name === "string" && normalized.name.trim()) {
+    workflowCacheByName.set(normalized.name.trim().toLowerCase(), entry);
+  }
+}
+
+function getCachedWorkflow(workflowId?: string, workflowName?: string): WorkflowLike | null {
+  pruneWorkflowCache();
+  if (workflowId) {
+    const byId = workflowCacheById.get(workflowId);
+    if (byId) return byId.workflow;
+    const byNameAsId = workflowCacheByName.get(workflowId.toLowerCase());
+    if (byNameAsId) return byNameAsId.workflow;
+  }
+  if (workflowName) {
+    const byName = workflowCacheByName.get(workflowName.toLowerCase());
+    if (byName) return byName.workflow;
+  }
+  return null;
+}
+
+function parseWorkflowGraph(workflow: WorkflowLike, searchTerm: string): { nodes: any[]; edges: any[] } {
+  let nodes: any[] = [];
+  let edges: any[] = [];
+  try {
+    nodes = typeof workflow.nodesJson === "string" ? JSON.parse(workflow.nodesJson) : (workflow.nodes || []);
+    edges = typeof workflow.edgesJson === "string" ? JSON.parse(workflow.edgesJson) : (workflow.edges || []);
+  } catch (e) {
+    throw new Error(`Workflow "${searchTerm}" has invalid nodes/edges JSON: ${(e as Error).message}`);
+  }
+  if (!Array.isArray(nodes) || nodes.length === 0) {
+    throw new Error(`Workflow "${searchTerm}" has no nodes`);
+  }
+  return { nodes, edges: Array.isArray(edges) ? edges : [] };
+}
+
+function applySSEEvent(
+  state: ParsedSSEResult,
+  event: any,
+  options: ParsedSSEOptions,
+): void {
+  if (options.includeEvents) {
+    if (!state.events) state.events = [];
+    state.events.push(event);
+  }
+
+  if (event?.type === "run_started") {
+    state.runId = event.data?.runId || state.runId;
+  }
+
+  if (event?.type === "node_log") {
+    const message = typeof event.data?.message === "string" ? event.data.message : "";
+    if (message) {
+      if (options.includeLiveLogs !== false) {
+        state.logs.push(message);
+        const liveLogLimit = Number.isFinite(options.liveLogLimit) ? Math.max(1, Number(options.liveLogLimit)) : 300;
+        if (state.logs.length > liveLogLimit) {
+          state.logs = state.logs.slice(-liveLogLimit);
+        }
+      }
+      if (options.streamProgress) {
+        const runHint = state.runId || "pending";
+        const nodeHint = event.data?.nodeId || "node";
+        console.error(`[canvas:${runHint}] ${nodeHint}: ${message}`);
+      }
+    }
+  }
+
+  if (event?.type === "run_completed") {
+    state.runId = event.data?.runId || state.runId;
+    state.status = event.data?.status || "completed";
+    state.results = event.data?.results || state.results;
+  }
+
+  if (event?.type === "run_failed") {
+    state.runId = event.data?.runId || state.runId;
+    state.status = event.data?.status || "failed";
+    if (typeof event.data?.error === "string") {
+      state.error = event.data.error;
+    }
+  }
+
+  if (event?.type === "error") {
+    state.status = "failed";
+    if (typeof event.data?.message === "string") {
+      state.error = event.data.message;
+    }
+  }
+}
+
+function parseSSELine(line: string): any | null {
+  const dataStr = line.startsWith("data: ")
+    ? line.slice(6)
+    : line.startsWith("data:")
+      ? line.slice(5)
+      : null;
+  if (!dataStr || dataStr === "[DONE]") return null;
+  return JSON.parse(dataStr);
 }
 
 // ============================================================================
@@ -208,15 +423,19 @@ const CANVAS_TOOLS = [
   },
   {
     name: "run_workflow_and_wait",
-    description: "Run a workflow and wait for completion. Best for autonomous agents.",
+    description: "Run a workflow and wait for completion. Supports optional live log collection and progress streaming.",
     inputSchema: {
       type: "object",
       properties: {
         workflow_id: { type: "string", description: "Workflow UUID" },
         workflow_name: { type: "string", description: "Workflow name to search for" },
         user_prompt: { type: "string", description: "Optional context/input" },
-        max_wait_seconds: { type: "number", description: "Max wait time (default: 300, max: 600)" },
-        poll_interval_seconds: { type: "number", description: "Poll interval (default: 5)" }
+        max_wait_seconds: { type: "number", description: "Optional max wait time in seconds. Omit or set <= 0 to disable MCP-layer timeout." },
+        poll_interval_seconds: { type: "number", description: "Compatibility field for clients expecting polling semantics (not used by stream execution)." },
+        stale_threshold_seconds: { type: "number", description: "Compatibility field for stale-run detection (not used by stream execution)." },
+        include_live_logs: { type: "boolean", description: "Include node_log entries in the final response (default: true)." },
+        live_log_limit: { type: "number", description: "Max live log entries to keep (default: 300)." },
+        stream_progress: { type: "boolean", description: "Emit incremental progress lines to server logs while waiting (default: false)." }
       }
     }
   },
@@ -249,7 +468,9 @@ const CANVAS_TOOLS = [
       type: "object",
       properties: {
         message: { type: "string", description: "Natural language request (e.g., 'Create a workflow with text input and agent')" },
-        canvas_state: { type: "object", description: "Optional current canvas state with nodes and connections" }
+        canvas_state: { type: "object", description: "Optional current canvas state with nodes and connections" },
+        agent_id: { type: "string", description: "Optional preferred orchestration agent (default: agent-builder)." },
+        model: { type: "string", description: "Optional model alias/id for assistant chat (default: sonnet)." }
       },
       required: ["message"]
     }
@@ -261,7 +482,9 @@ const CANVAS_TOOLS = [
       type: "object",
       properties: {
         transcription: { type: "string", description: "Voice transcription text" },
-        canvas_state: { type: "object", description: "Optional current canvas state with nodes and connections" }
+        canvas_state: { type: "object", description: "Optional current canvas state with nodes and connections" },
+        agent_id: { type: "string", description: "Optional preferred orchestration agent (default: agent-builder)." },
+        model: { type: "string", description: "Optional model alias/id for assistant chat (default: sonnet)." }
       },
       required: ["transcription"]
     }
@@ -325,11 +548,13 @@ const CANVAS_TOOLS = [
 const AGENT_TOOLS = [
   {
     name: "agent_list",
-    description: "List available agents from the Agent Gateway.",
+    description: "List available agents from the Agent Gateway. Supports targeted lookup by agent_id to avoid full-list scans.",
     inputSchema: {
       type: "object",
       properties: {
-        limit: { type: "number", description: "Max agents to return (default: 10)" }
+        limit: { type: "number", description: "Max agents to return (default: 10)" },
+        search: { type: "string", description: "Optional case-insensitive search on id/name/description." },
+        agent_id: { type: "string", description: "Optional exact agent id for targeted lookup." }
       }
     }
   },
@@ -495,36 +720,145 @@ const TOOLS = [...CANVAS_TOOLS, ...AGENT_TOOLS, ...A2A_TOOLS, ...WALLET_TOOLS, .
 // CANVAS TOOL HANDLERS
 // ============================================================================
 
-/** Parse an SSE response from the canvas execution endpoint into a structured result. */
-function parseSSEResult(sseText: string): any {
-  const events: any[] = [];
-  let runId = "";
-  let status = "unknown";
-  let results: Record<string, any> = {};
-  const logs: string[] = [];
+/** Parse an SSE payload string from canvas execution into a structured result. */
+function parseSSEResult(sseText: string, options: ParsedSSEOptions = {}): ParsedSSEResult {
+  const state: ParsedSSEResult = {
+    runId: "",
+    status: "unknown",
+    results: {},
+    logs: [],
+    event_count: 0,
+  };
 
-  for (const line of sseText.split("\n")) {
-    const dataStr = line.startsWith("data: ") ? line.slice(6) : line.startsWith("data:") ? line.slice(5) : null;
-    if (!dataStr || dataStr === "[DONE]") continue;
+  for (const line of sseText.split(/\r?\n/)) {
+    let event: any;
     try {
-      const event = JSON.parse(dataStr);
-      events.push(event);
-      if (event.type === "run_started") runId = event.data?.runId || runId;
-      if (event.type === "node_log") logs.push(event.data?.message || "");
-      if (event.type === "run_completed") {
-        runId = event.data?.runId || runId;
-        status = event.data?.status || "completed";
-        results = event.data?.results || results;
-      }
-      if (event.type === "run_failed") {
-        runId = event.data?.runId || runId;
-        status = event.data?.status || "failed";
-      }
-      if (event.type === "error") status = "failed";
-    } catch (e) { console.error("[sse] Dropped malformed SSE line:", dataStr?.slice(0, 200)); }
+      event = parseSSELine(line);
+    } catch {
+      continue;
+    }
+    if (!event) continue;
+    state.event_count += 1;
+    applySSEEvent(state, event, options);
   }
 
-  return { runId, status, results, logs, event_count: events.length };
+  return state;
+}
+
+/** Parse an SSE HTTP response incrementally for better long-run observability. */
+async function parseSSEResponse(response: Response, options: ParsedSSEOptions = {}): Promise<ParsedSSEResult> {
+  if (!response.body) {
+    return parseSSEResult(await response.text(), options);
+  }
+
+  const state: ParsedSSEResult = {
+    runId: "",
+    status: "unknown",
+    results: {},
+    logs: [],
+    event_count: 0,
+  };
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      let event: any;
+      try {
+        event = parseSSELine(line);
+      } catch {
+        continue;
+      }
+      if (!event) continue;
+      state.event_count += 1;
+      applySSEEvent(state, event, options);
+    }
+  }
+
+  if (buffer.trim().length > 0) {
+    try {
+      const event = parseSSELine(buffer);
+      if (event) {
+        state.event_count += 1;
+        applySSEEvent(state, event, options);
+      }
+    } catch {
+      // ignore trailing partial line
+    }
+  }
+
+  return state;
+}
+
+function findMatchingWorkflow(workflows: WorkflowLike[], workflowId?: string, workflowName?: string): WorkflowLike | null {
+  if (!workflowId && !workflowName) return null;
+  const targetId = workflowId?.trim();
+  const targetName = workflowName?.trim().toLowerCase();
+  for (const workflow of workflows) {
+    const id = getWorkflowId(workflow);
+    const name = typeof workflow.name === "string" ? workflow.name.trim().toLowerCase() : "";
+    if (targetId && (id === targetId || name === targetId.toLowerCase())) return workflow;
+    if (targetName && name === targetName) return workflow;
+  }
+  return null;
+}
+
+async function fetchWorkflows(headers: Record<string, string>, search?: string, limit?: number): Promise<WorkflowLike[]> {
+  const params = new URLSearchParams();
+  if (search) params.append("search", search);
+  if (Number.isFinite(limit) && (limit as number) > 0) params.append("limit", String(limit));
+  const query = params.toString();
+  const url = `${CANVAS_API_URL}/canvas/workflows${query ? `?${query}` : ""}`;
+  const response = await fetchWithTimeout(url, { headers }, 30000);
+  if (!response.ok) {
+    throw new Error(`Failed to load workflows: ${await response.text()}`);
+  }
+  const data = await response.json() as any;
+  const workflows: WorkflowLike[] = Array.isArray(data?.workflows)
+    ? data.workflows
+    : Array.isArray(data)
+      ? data
+      : [];
+  workflows.forEach(cacheWorkflow);
+  return workflows;
+}
+
+async function findWorkflow(headers: Record<string, string>, workflowId?: string, workflowName?: string): Promise<WorkflowLike | null> {
+  const cached = getCachedWorkflow(workflowId, workflowName);
+  if (cached) return cached;
+
+  const searchTerm = workflowName || workflowId;
+  if (searchTerm) {
+    const searched = await fetchWorkflows(headers, searchTerm, WORKFLOW_LOOKUP_LIMIT).catch(() => [] as WorkflowLike[]);
+    const matchFromSearch = findMatchingWorkflow(searched, workflowId, workflowName);
+    if (matchFromSearch) return matchFromSearch;
+  }
+
+  const workflows = await fetchWorkflows(headers, undefined, WORKFLOW_LOOKUP_LIMIT);
+  return findMatchingWorkflow(workflows, workflowId, workflowName);
+}
+
+function buildWorkflowExecutionRequest(
+  workflow: WorkflowLike,
+  args: Record<string, any>,
+  searchTerm: string,
+): Record<string, any> {
+  const { nodes, edges } = parseWorkflowGraph(workflow, searchTerm);
+  return {
+    nodes: normalizeWorkflowNodes(nodes.map((n: any) => ({ id: n.id, type: n.type, data: n.data }))),
+    connections: edges.map((e: any) => ({ source: e.source, target: e.target })),
+    ...(args.inputs ? { inputs: args.inputs } : {}),
+    ...(args.user_prompt ? { userPrompt: String(args.user_prompt) } : {}),
+    ...(args.userPrompt ? { userPrompt: String(args.userPrompt) } : {}),
+  };
 }
 
 async function handleCanvasTool(name: string, args: Record<string, any>, marketplace: MarketplaceManager): Promise<any> {
@@ -545,8 +879,12 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
         300000
       );
       if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
-      const sseText = await response.text();
-      return parseSSEResult(sseText);
+      return await parseSSEResponse(response, {
+        includeEvents: Boolean(args.include_events),
+        includeLiveLogs: args.include_live_logs !== false,
+        liveLogLimit: Number(args.live_log_limit || 300),
+        streamProgress: Boolean(args.stream_progress),
+      });
     }
 
     case "canvas_execute_workflow_async": {
@@ -558,9 +896,15 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
         300000
       );
       if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
-      const sseText = await response.text();
-      const result = parseSSEResult(sseText);
-      return { runId: result.runId, status: result.status, message: `Workflow started. Use canvas_get_workflow_run("${result.runId}") to check status.` };
+      const result = await parseSSEResponse(response, {
+        includeLiveLogs: false,
+        streamProgress: false,
+      });
+      return {
+        runId: result.runId,
+        status: result.status,
+        message: `Workflow started. Use canvas_get_workflow_run("${result.runId}") to check status.`,
+      };
     }
 
     case "canvas_get_workflow_run": {
@@ -596,71 +940,60 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
         60000
       );
       if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
-      return await response.json();
+      const saved = await response.json() as any;
+      const workflowId = getWorkflowId(saved) || saved.workflowId || saved.entityId || saved.id;
+      const syntheticWorkflow: WorkflowLike = {
+        entityId: workflowId,
+        workflowId,
+        name: saveArgs.name,
+        description: saveArgs.description || "",
+        nodesJson: JSON.stringify(saveArgs.nodes || []),
+        edgesJson: JSON.stringify(saveArgs.connections || []),
+        createdAt: new Date().toISOString(),
+      };
+      cacheWorkflow(syntheticWorkflow);
+      return saved;
     }
 
     case "canvas_get_workflows": {
-      const params = new URLSearchParams();
-      if (args.search) params.append("search", args.search);
       const requestedLimit = args.limit || 10;
-      const response = await fetchWithTimeout(
-        `${CANVAS_API_URL}/canvas/workflows`,
-        { headers },
-        30000
-      );
-      if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
-      const wfData = await response.json() as any;
-      let workflows = wfData.workflows || [];
-      // Client-side search filtering (gateway may not support search param)
+      const workflows = await fetchWorkflows(headers, args.search, Math.max(requestedLimit * 3, 30));
+
+      // Merge with cache to bridge eventual consistency after save/update.
+      pruneWorkflowCache();
+      const cachedWorkflows = Array.from(workflowCacheById.values()).map((entry) => entry.workflow);
+      const byId = new Map<string, WorkflowLike>();
+      for (const wf of [...cachedWorkflows, ...workflows]) {
+        const id = getWorkflowId(wf);
+        if (id) byId.set(id, wf);
+      }
+      let merged = Array.from(byId.values());
       if (args.search) {
-        const q = args.search.toLowerCase();
-        workflows = workflows.filter((w: any) =>
-          (w.name || "").toLowerCase().includes(q) || (w.description || "").toLowerCase().includes(q)
+        const q = String(args.search).toLowerCase();
+        merged = merged.filter((w: any) =>
+          String(w.name || "").toLowerCase().includes(q) || String(w.description || "").toLowerCase().includes(q)
         );
       }
-      // Apply limit
-      workflows = workflows.slice(0, requestedLimit);
+      const totalMatches = merged.length;
+      merged = merged.slice(0, requestedLimit);
+
       // Strip verbose fields for compact output
-      const compact = workflows.map((w: any) => ({
-        entityId: w.entityId,
+      const compact = merged.map((w: any) => ({
+        entityId: getWorkflowId(w),
         name: w.name,
         description: w.description || "",
         createdAt: w.createdAt,
         nodeCount: (() => { try { return (typeof w.nodesJson === "string" ? JSON.parse(w.nodesJson) : w.nodes || []).length; } catch { return 0; } })(),
       }));
-      return { workflows: compact, count: compact.length, total: (wfData.workflows || []).length };
+      return { workflows: compact, count: compact.length, total: totalMatches };
     }
 
     case "run_saved_canvas_workflow": {
-      // Load saved workflow and execute via SSE
-      const wfResponse = await fetchWithTimeout(
-        `${CANVAS_API_URL}/canvas/workflows`,
-        { headers },
-        30000
-      );
-      if (!wfResponse.ok) throw new Error(`Failed to load workflows: ${await wfResponse.text()}`);
-      const wfData = await wfResponse.json() as any;
-      const workflows = wfData.workflows || [];
-      const wf = workflows.find((w: any) =>
-        (args.workflow_id && (w.entityId === args.workflow_id || w.name === args.workflow_id)) ||
-        (args.workflow_name && w.name === args.workflow_name)
-      );
       const searchTerm = args.workflow_id || args.workflow_name || "unknown";
+      const wf = await findWorkflow(headers, args.workflow_id, args.workflow_name);
       if (!wf) throw new Error(`Workflow "${searchTerm}" not found`);
 
-      let nodes: any[], edges: any[];
-      try {
-        nodes = typeof wf.nodesJson === "string" ? JSON.parse(wf.nodesJson) : (wf.nodes || []);
-        edges = typeof wf.edgesJson === "string" ? JSON.parse(wf.edgesJson) : (wf.edges || []);
-      } catch (e) {
-        throw new Error("Workflow nodes/edges JSON is corrupted: " + (e as Error).message);
-      }
-      if (!Array.isArray(nodes) || nodes.length === 0) throw new Error(`Workflow "${searchTerm}" has no nodes`);
-      const request: Record<string, any> = {
-        nodes: normalizeWorkflowNodes(nodes.map((n: any) => ({ id: n.id, type: n.type, data: n.data }))),
-        connections: (Array.isArray(edges) ? edges : []).map((e: any) => ({ source: e.source, target: e.target })),
-        ...(args.inputs ? { inputs: args.inputs } : {})
-      };
+      const request = buildWorkflowExecutionRequest(wf, args, searchTerm);
 
       const response = await fetchWithTimeout(
         `${CANVAS_API_URL}/canvas/workflows/execute/stream`,
@@ -668,51 +1001,45 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
         300000
       );
       if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
-      const sseText = await response.text();
-      return parseSSEResult(sseText);
+      return await parseSSEResponse(response, {
+        includeEvents: Boolean(args.include_events),
+        includeLiveLogs: args.include_live_logs !== false,
+        liveLogLimit: Number(args.live_log_limit || 300),
+        streamProgress: Boolean(args.stream_progress),
+      });
     }
 
     case "run_workflow_and_wait": {
-      // Same as run_saved_canvas_workflow — SSE blocks until completion
-      const wfResponse = await fetchWithTimeout(
-        `${CANVAS_API_URL}/canvas/workflows`,
-        { headers },
-        30000
-      );
-      if (!wfResponse.ok) throw new Error(`Failed to load workflows: ${await wfResponse.text()}`);
-      const wfData = await wfResponse.json() as any;
-      const workflows = wfData.workflows || [];
-      const wf = workflows.find((w: any) =>
-        (args.workflow_id && (w.entityId === args.workflow_id || w.name === args.workflow_id)) ||
-        (args.workflow_name && w.name === args.workflow_name)
-      );
       const searchTerm = args.workflow_id || args.workflow_name || "unknown";
+      const wf = await findWorkflow(headers, args.workflow_id, args.workflow_name);
       if (!wf) throw new Error(`Workflow "${searchTerm}" not found`);
 
-      let nodes: any[], edges: any[];
-      try {
-        nodes = typeof wf.nodesJson === "string" ? JSON.parse(wf.nodesJson) : (wf.nodes || []);
-        edges = typeof wf.edgesJson === "string" ? JSON.parse(wf.edgesJson) : (wf.edges || []);
-      } catch (e) {
-        throw new Error("Workflow nodes/edges JSON is corrupted: " + (e as Error).message);
-      }
-      if (!Array.isArray(nodes) || nodes.length === 0) throw new Error(`Workflow "${searchTerm}" has no nodes`);
-      const request: Record<string, any> = {
-        nodes: normalizeWorkflowNodes(nodes.map((n: any) => ({ id: n.id, type: n.type, data: n.data }))),
-        connections: (Array.isArray(edges) ? edges : []).map((e: any) => ({ source: e.source, target: e.target })),
-        ...(args.inputs ? { inputs: args.inputs } : {})
-      };
+      const request = buildWorkflowExecutionRequest(wf, args, searchTerm);
 
       const start = Date.now();
+      const requestedWaitSeconds = Number(args.max_wait_seconds);
+      const maxWaitSeconds = Number.isFinite(requestedWaitSeconds) ? requestedWaitSeconds : 0;
+      const timeoutMs = maxWaitSeconds > 0 ? maxWaitSeconds * 1000 : undefined;
+
       const response = await fetchWithTimeout(
         `${CANVAS_API_URL}/canvas/workflows/execute/stream`,
         { method: "POST", headers, body: JSON.stringify(request) },
-        Math.min(args.max_wait_seconds || 300, 600) * 1000
+        timeoutMs
       );
       if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
-      const sseText = await response.text();
-      const result = parseSSEResult(sseText);
-      return { ...result, elapsed_seconds: Math.round((Date.now() - start) / 1000) };
+      const result = await parseSSEResponse(response, {
+        includeEvents: Boolean(args.include_events),
+        includeLiveLogs: args.include_live_logs !== false,
+        liveLogLimit: Number(args.live_log_limit || 300),
+        streamProgress: Boolean(args.stream_progress),
+      });
+      return {
+        ...result,
+        elapsed_seconds: Math.round((Date.now() - start) / 1000),
+        max_wait_seconds: maxWaitSeconds > 0 ? maxWaitSeconds : null,
+        poll_interval_seconds: args.poll_interval_seconds ?? null,
+        stale_threshold_seconds: args.stale_threshold_seconds ?? null,
+      };
     }
 
     case "canvas_get_available_tools": {
@@ -784,18 +1111,42 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       // Use agent chat endpoint with a structured prompt
       const userMessage = name === "canvas_ai_assistant_voice" ? args.transcription : args.message;
       if (!userMessage) throw new Error("Message or transcription is required");
+      const preferredAgentId = String(args.agent_id || "agent-builder");
+      const model = normalizeGatewayModelName(args.model || "sonnet", "sonnet");
 
-      // Find a suitable agent
-      const agentsResponse = await fetchWithTimeout(
-        `${AGENT_GATEWAY_URL}/agents`,
-        { headers: { "Content-Type": "application/json", ...(token ? { "Authorization": `Bearer ${token}` } : {}) } },
-        15000
-      );
-      if (!agentsResponse.ok) throw new Error(`Failed to list agents: ${agentsResponse.status}`);
-      const agentsData = await agentsResponse.json() as any;
-      const agents = agentsData.agents || [];
-      const agent = agents.find((a: any) => !a.requiredSecrets?.length) || agents[0];
-      if (!agent) throw new Error("No agents available for AI assistant");
+      // Resolve a suitable agent without pulling the full catalog unless needed.
+      let agent: any | null = null;
+      const candidateIds = [preferredAgentId, "agent-builder", "workflow-orchestration-agent", "code-assistant"];
+      for (const candidateId of candidateIds) {
+        try {
+          const detailResponse = await fetchWithTimeout(
+            `${AGENT_GATEWAY_URL}/agents/${encodeURIComponent(candidateId)}`,
+            { headers: { "Content-Type": "application/json", ...(token ? { "Authorization": `Bearer ${token}` } : {}) } },
+            15000
+          );
+          if (!detailResponse.ok) continue;
+          const detail = await detailResponse.json() as any;
+          if (!detail?.requiredSecrets?.length) {
+            agent = detail;
+            break;
+          }
+        } catch {
+          // fall through to the next candidate
+        }
+      }
+
+      if (!agent) {
+        const agentsResponse = await fetchWithTimeout(
+          `${AGENT_GATEWAY_URL}/agents`,
+          { headers: { "Content-Type": "application/json", ...(token ? { "Authorization": `Bearer ${token}` } : {}) } },
+          15000
+        );
+        if (!agentsResponse.ok) throw new Error(`Failed to list agents: ${agentsResponse.status}`);
+        const agentsData = await agentsResponse.json() as any;
+        const agents = agentsData.agents || [];
+        agent = agents.find((a: any) => a.id === preferredAgentId) || agents.find((a: any) => !a.requiredSecrets?.length) || agents[0];
+      }
+      if (!agent?.id) throw new Error("No agents available for AI assistant");
 
       // Build the prompt
       let prompt = CANVAS_AI_SYSTEM_PROMPT + "\n\n";
@@ -807,7 +1158,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       // Create session and chat
       const sessionResponse = await fetchWithTimeout(
         `${AGENT_GATEWAY_URL}/agents/${encodeURIComponent(agent.id)}/sessions`,
-        { method: "POST", headers, body: JSON.stringify({ model: "sonnet" }) },
+        { method: "POST", headers, body: JSON.stringify({ model }) },
         15000
       );
       if (!sessionResponse.ok) throw new Error(`Failed to create session: ${sessionResponse.status}`);
@@ -815,7 +1166,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
 
       const chatResponse = await fetchWithTimeout(
         `${AGENT_GATEWAY_URL}/agents/${encodeURIComponent(agent.id)}/sessions/${encodeURIComponent(sessionData.id)}/chat`,
-        { method: "POST", headers: { ...headers, "Accept": "text/event-stream" }, body: JSON.stringify({ message: prompt, model: "sonnet" }) },
+        { method: "POST", headers: { ...headers, "Accept": "text/event-stream" }, body: JSON.stringify({ message: prompt, model }) },
         120000
       );
       if (!chatResponse.ok) throw new Error(`Chat failed: ${chatResponse.status} ${await chatResponse.text()}`);
@@ -852,28 +1203,12 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
     }
 
     case "update_canvas_workflow": {
-      // Fetch → merge → save as new version (with retry for Geo propagation delay)
-      const findWorkflow = async (): Promise<any> => {
-        for (let attempt = 0; attempt < 2; attempt++) {
-          const wfResponse = await fetchWithTimeout(`${CANVAS_API_URL}/canvas/workflows`, { headers }, 30000);
-          if (!wfResponse.ok) throw new Error(`Failed to load workflows: ${await wfResponse.text()}`);
-          const wfData = await wfResponse.json() as any;
-          const workflows = wfData.workflows || [];
-          const wf = workflows.find((w: any) => w.entityId === args.workflow_id || w.name === args.workflow_id);
-          if (wf) return wf;
-          if (attempt === 0) await new Promise(r => setTimeout(r, 3000)); // wait for Geo propagation
-        }
+      const wf = await findWorkflow(headers, args.workflow_id, args.workflow_id);
+      if (!wf) {
         throw new Error(`Workflow "${args.workflow_id}" not found. If recently saved, try again in a few seconds.`);
-      };
-      const wf = await findWorkflow();
-
-      let existingNodes: any[], existingEdges: any[];
-      try {
-        existingNodes = typeof wf.nodesJson === "string" ? JSON.parse(wf.nodesJson) : (wf.nodes || []);
-        existingEdges = typeof wf.edgesJson === "string" ? JSON.parse(wf.edgesJson) : (wf.edges || []);
-      } catch (e) {
-        throw new Error("Workflow nodes/edges JSON is corrupted: " + (e as Error).message);
       }
+
+      const { nodes: existingNodes, edges: existingEdges } = parseWorkflowGraph(wf, String(args.workflow_id));
 
       const updatedNodes = args.nodes ? normalizeWorkflowNodes(args.nodes) : existingNodes;
       const savePayload: Record<string, any> = {
@@ -890,6 +1225,14 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       );
       if (!saveResponse.ok) throw new Error(`Failed to save workflow: ${await saveResponse.text()}`);
       const saved = await saveResponse.json() as any;
+      cacheWorkflow({
+        entityId: getWorkflowId(saved),
+        workflowId: saved.workflowId || saved.entityId || saved.id,
+        name: savePayload.name,
+        description: savePayload.description,
+        nodesJson: JSON.stringify(savePayload.nodes || []),
+        edgesJson: JSON.stringify(savePayload.connections || []),
+      });
 
       return {
         success: true,
@@ -901,28 +1244,12 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
     }
 
     case "update_workflow_node": {
-      // Fetch → modify single node → save as new version (with retry for Geo propagation)
-      const findWf = async (): Promise<any> => {
-        for (let attempt = 0; attempt < 2; attempt++) {
-          const wfResponse = await fetchWithTimeout(`${CANVAS_API_URL}/canvas/workflows`, { headers }, 30000);
-          if (!wfResponse.ok) throw new Error(`Failed to load workflows: ${await wfResponse.text()}`);
-          const wfData = await wfResponse.json() as any;
-          const workflows = wfData.workflows || [];
-          const wf = workflows.find((w: any) => w.entityId === args.workflow_id || w.name === args.workflow_id);
-          if (wf) return wf;
-          if (attempt === 0) await new Promise(r => setTimeout(r, 3000)); // wait for Geo propagation
-        }
+      const wf = await findWorkflow(headers, args.workflow_id, args.workflow_id);
+      if (!wf) {
         throw new Error(`Workflow "${args.workflow_id}" not found. If recently saved, try again in a few seconds.`);
-      };
-      const wf = await findWf();
-
-      let nodes: any[], edges: any[];
-      try {
-        nodes = typeof wf.nodesJson === "string" ? JSON.parse(wf.nodesJson) : (wf.nodes || []);
-        edges = typeof wf.edgesJson === "string" ? JSON.parse(wf.edgesJson) : (wf.edges || []);
-      } catch (e) {
-        throw new Error("Workflow nodes/edges JSON is corrupted: " + (e as Error).message);
       }
+
+      const { nodes, edges } = parseWorkflowGraph(wf, String(args.workflow_id));
 
       const targetNode = nodes.find((n: any) => n.id === args.node_id);
       if (!targetNode) throw new Error(`Node "${args.node_id}" not found in workflow "${args.workflow_id}"`);
@@ -933,7 +1260,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       if (args.data) {
         targetNode.data = { ...targetNode.data, ...args.data };
         // Normalize model name if updated
-        if (targetNode.data.model) targetNode.data.model = normalizeModelName(targetNode.data.model);
+        if (targetNode.data.model) targetNode.data.model = normalizeCanvasModelName(targetNode.data.model);
       }
 
       const savePayload = {
@@ -950,6 +1277,14 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       );
       if (!saveResponse.ok) throw new Error(`Failed to save workflow: ${await saveResponse.text()}`);
       const saved = await saveResponse.json() as any;
+      cacheWorkflow({
+        entityId: getWorkflowId(saved),
+        workflowId: saved.workflowId || saved.entityId || saved.id,
+        name: savePayload.name,
+        description: savePayload.description,
+        nodesJson: JSON.stringify(savePayload.nodes || []),
+        edgesJson: JSON.stringify(savePayload.connections || []),
+      });
 
       return {
         success: true,
@@ -1008,86 +1343,17 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
 
 async function handleAgentTool(name: string, args: Record<string, any>, marketplace: MarketplaceManager): Promise<any> {
   const token = marketplace.getUserToken();
+  const authHeaders: Record<string, string> = token
+    ? { "Content-Type": "application/json", "Authorization": `Bearer ${token}` }
+    : { "Content-Type": "application/json" };
 
-  switch (name) {
-    case "agent_list": {
-      const response = await fetchWithTimeout(
-        `${AGENT_GATEWAY_URL}/agents`,
-        { headers: {
-          "Content-Type": "application/json",
-          ...(token ? { "Authorization": `Bearer ${token}` } : {})
-        } },
-        15000
-      );
-      if (!response.ok) throw new Error(`Agent Gateway returned ${response.status}: ${await response.text()}`);
-      const data = await response.json() as any;
-      const allAgents = data.agents || [];
-      const limit = args.limit || 10;
-      const agents = allAgents.slice(0, limit).map((a: any) => ({
-        id: a.id,
-        name: a.name,
-        description: (a.description || "").slice(0, 120),
-        model: a.model,
-        requiredSecrets: a.requiredSecrets,
-      }));
-      return { success: true, agents, count: agents.length, total: allAgents.length };
-    }
+  const parseAgentChatResponse = (responseText: string): { text: string; cost?: string } => {
+    let accumulatedText = "";
+    let cost: string | undefined;
 
-    case "agent_create_session": {
-      if (!token) return { success: false, error: "No auth token available." };
-      const response = await fetchWithTimeout(
-        `${AGENT_GATEWAY_URL}/agents/${encodeURIComponent(args.agent_id)}/sessions`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
-          body: JSON.stringify({ model: args.model || "haiku" })
-        },
-        15000
-      );
-      if (!response.ok) throw new Error(`Failed to create session: ${response.status} ${await response.text()}`);
-      const data = await response.json() as any;
-      return { success: true, session_id: data.id, agent_id: args.agent_id, model: args.model || "haiku" };
-    }
-
-    case "agent_chat": {
-      if (!token) return { success: false, error: "No auth token available." };
-      const { agent_id, message, session_id, model = "haiku" } = args;
-
-      // Get or create session
-      let sessionId = session_id;
-      if (!sessionId) {
-        const sessionResponse = await fetchWithTimeout(
-          `${AGENT_GATEWAY_URL}/agents/${encodeURIComponent(agent_id)}/sessions`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
-            body: JSON.stringify({ model })
-          },
-          15000
-        );
-        if (!sessionResponse.ok) throw new Error(`Failed to create session: ${sessionResponse.status} ${await sessionResponse.text()}`);
-        const sessionData = await sessionResponse.json() as any;
-        sessionId = sessionData.id;
-      }
-
-      // Send chat message
-      const chatResponse = await fetchWithTimeout(
-        `${AGENT_GATEWAY_URL}/agents/${encodeURIComponent(agent_id)}/sessions/${encodeURIComponent(sessionId!)}/chat`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}`, "Accept": "text/event-stream" },
-          body: JSON.stringify({ message, model })
-        },
-        300000
-      );
-      if (!chatResponse.ok) throw new Error(`Chat failed: ${chatResponse.status} ${await chatResponse.text()}`);
-
-      // Parse SSE stream
-      const responseText = await chatResponse.text();
-      let accumulatedText = "";
-      let cost: string | undefined;
-      const lines = responseText.split("\n");
-      for (const line of lines) {
+    const isSSE = responseText.includes("data: ") || responseText.includes("data:");
+    if (isSSE) {
+      for (const line of responseText.split(/\r?\n/)) {
         if (!line.startsWith("data: ") && !line.startsWith("data:")) continue;
         const dataStr = line.startsWith("data: ") ? line.slice(6) : line.slice(5);
         if (dataStr === "[DONE]") break;
@@ -1103,21 +1369,152 @@ async function handleAgentTool(name: string, args: Record<string, any>, marketpl
           if (event.type === "done" && event.data?.cost) cost = event.data.cost;
           if (event.type === "usage" && event.data?.cost) cost = event.data.cost;
           if (event.type === "error") {
-            const errMsg = event.data?.message || JSON.stringify(event.data);
-            throw new Error(`Agent error: ${errMsg}`);
+            throw new Error(`Agent error: ${event.data?.message || JSON.stringify(event.data)}`);
           }
         } catch (e) {
           if (e instanceof Error && e.message.startsWith("Agent error:")) throw e;
           console.error("[sse] Dropped malformed SSE line:", dataStr?.slice(0, 200));
         }
       }
+    } else {
+      try {
+        const jsonResp = JSON.parse(responseText) as any;
+        accumulatedText = jsonResp.text || jsonResp.response || jsonResp.content || responseText;
+        cost = jsonResp.cost;
+      } catch {
+        accumulatedText = responseText;
+      }
+    }
+
+    if (!accumulatedText && responseText.length > 0) {
+      accumulatedText = `[No text extracted from response. Raw length: ${responseText.length}, starts with: ${responseText.slice(0, 100)}]`;
+    }
+
+    return { text: accumulatedText, cost };
+  };
+
+  const createSession = async (agentId: string, modelInput?: string): Promise<string> => {
+    const model = normalizeGatewayModelName(modelInput, "haiku");
+    const sessionResponse = await fetchWithTimeout(
+      `${AGENT_GATEWAY_URL}/agents/${encodeURIComponent(agentId)}/sessions`,
+      {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ model }),
+      },
+      15000
+    );
+    if (!sessionResponse.ok) {
+      throw new Error(`Failed to create session: ${sessionResponse.status} ${await sessionResponse.text()}`);
+    }
+    const sessionData = await sessionResponse.json() as any;
+    if (!sessionData?.id) throw new Error("Failed to create session: missing session id.");
+    return sessionData.id;
+  };
+
+  const sendChat = async (
+    agentId: string,
+    sessionId: string,
+    message: string,
+    modelInput?: string,
+  ): Promise<{ text: string; cost?: string }> => {
+    const model = normalizeGatewayModelName(modelInput, "haiku");
+    const chatResponse = await fetchWithTimeout(
+      `${AGENT_GATEWAY_URL}/agents/${encodeURIComponent(agentId)}/sessions/${encodeURIComponent(sessionId)}/chat`,
+      {
+        method: "POST",
+        headers: { ...authHeaders, "Accept": "text/event-stream" },
+        body: JSON.stringify({ message, model }),
+      },
+      300000
+    );
+    if (!chatResponse.ok) {
+      throw new Error(`Chat failed: ${chatResponse.status} ${await chatResponse.text()}`);
+    }
+    const responseText = await chatResponse.text();
+    return parseAgentChatResponse(responseText);
+  };
+
+  switch (name) {
+    case "agent_list": {
+      if (args.agent_id) {
+        const response = await fetchWithTimeout(
+          `${AGENT_GATEWAY_URL}/agents/${encodeURIComponent(String(args.agent_id))}`,
+          { headers: authHeaders },
+          15000
+        );
+        if (response.ok) {
+          const agent = await response.json() as any;
+          return {
+            success: true,
+            agents: [{
+              id: agent.id,
+              name: agent.name,
+              description: (agent.description || "").slice(0, 120),
+              model: agent.model,
+              requiredSecrets: agent.requiredSecrets,
+            }],
+            count: 1,
+            total: 1,
+            targeted: true,
+          };
+        }
+      }
+
+      const response = await fetchWithTimeout(
+        `${AGENT_GATEWAY_URL}/agents`,
+        { headers: authHeaders },
+        15000
+      );
+      if (!response.ok) throw new Error(`Agent Gateway returned ${response.status}: ${await response.text()}`);
+      const data = await response.json() as any;
+      const allAgents = data.agents || [];
+      let filteredAgents = allAgents;
+      if (args.search) {
+        const q = String(args.search).toLowerCase();
+        filteredAgents = allAgents.filter((a: any) =>
+          String(a.id || "").toLowerCase().includes(q) ||
+          String(a.name || "").toLowerCase().includes(q) ||
+          String(a.description || "").toLowerCase().includes(q)
+        );
+      }
+      const limit = args.limit || 10;
+      const agents = filteredAgents.slice(0, limit).map((a: any) => ({
+        id: a.id,
+        name: a.name,
+        description: (a.description || "").slice(0, 120),
+        model: a.model,
+        requiredSecrets: a.requiredSecrets,
+      }));
+      return { success: true, agents, count: agents.length, total: filteredAgents.length };
+    }
+
+    case "agent_create_session": {
+      if (!token) return { success: false, error: "No auth token available." };
+      const normalizedModel = normalizeGatewayModelName(args.model, "haiku");
+      const sessionId = await createSession(String(args.agent_id), normalizedModel);
+      return { success: true, session_id: sessionId, agent_id: args.agent_id, model: normalizedModel };
+    }
+
+    case "agent_chat": {
+      if (!token) return { success: false, error: "No auth token available." };
+      const { agent_id, message, session_id } = args;
+      const model = normalizeGatewayModelName(args.model, "haiku");
+
+      // Get or create session
+      let sessionId = session_id;
+      if (!sessionId) {
+        sessionId = await createSession(String(agent_id), model);
+      }
+
+      const chat = await sendChat(String(agent_id), String(sessionId), String(message), model);
 
       return {
         success: true,
         agent_id,
         session_id: sessionId,
-        text: accumulatedText,
-        cost,
+        text: chat.text,
+        cost: chat.cost,
         message: `Use session_id="${sessionId}" for follow-up messages.`
       };
     }
@@ -1166,60 +1563,56 @@ async function handleAgentTool(name: string, args: Record<string, any>, marketpl
 
     case "agent_resume_session": {
       if (!token) return { success: false, error: "No auth token available." };
-      const { agent_id, session_id, message, model = "haiku" } = args;
-      const chatResponse = await fetchWithTimeout(
-        `${AGENT_GATEWAY_URL}/agents/${encodeURIComponent(agent_id)}/sessions/${encodeURIComponent(session_id)}/chat`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}`, "Accept": "text/event-stream" },
-          body: JSON.stringify({ message, model })
-        },
-        300000
-      );
-      if (!chatResponse.ok) throw new Error(`Chat failed: ${chatResponse.status} ${await chatResponse.text()}`);
-      const responseText = await chatResponse.text();
-      let accumulatedText = "";
-      let cost: string | undefined;
+      const { agent_id, session_id, message } = args;
+      const model = normalizeGatewayModelName(args.model, "haiku");
+      try {
+        const chat = await sendChat(String(agent_id), String(session_id), String(message), model);
+        return { success: true, agent_id, session_id, text: chat.text, cost: chat.cost, message: `Session "${session_id}" resumed.` };
+      } catch (error) {
+        const errMessage = error instanceof Error ? error.message : String(error);
+        const sessionMismatch =
+          errMessage.includes("tool_use") &&
+          errMessage.includes("tool_result") &&
+          errMessage.includes("without");
 
-      // Check if response is SSE format or plain JSON
-      const isSSE = responseText.includes("data: ") || responseText.includes("data:");
-      if (isSSE) {
-        for (const line of responseText.split("\n")) {
-          if (!line.startsWith("data: ") && !line.startsWith("data:")) continue;
-          const dataStr = line.startsWith("data: ") ? line.slice(6) : line.slice(5);
-          if (dataStr === "[DONE]") break;
-          try {
-            const event = JSON.parse(dataStr) as any;
-            if (event.type === "text") {
-              if (typeof event.data === "string") accumulatedText += event.data;
-              else if (event.data?.text) accumulatedText += event.data.text;
-            }
-            if (event.type === "content_block_delta" && event.delta?.text) accumulatedText += event.delta.text;
-            if (event.type === "done" && event.data?.cost) cost = event.data.cost;
-            if (event.type === "usage" && event.data?.cost) cost = event.data.cost;
-            if (event.type === "error") throw new Error(`Agent error: ${event.data?.message || JSON.stringify(event.data)}`);
-          } catch (e) {
-            if (e instanceof Error && e.message.startsWith("Agent error:")) throw e;
-            console.error("[sse] Dropped malformed SSE line:", dataStr?.slice(0, 200));
-          }
+        if (!sessionMismatch) throw error;
+
+        // Recovery path for corrupted tool-use history: start a fresh session and continue.
+        const sessionDetailsResponse = await fetchWithTimeout(
+          `${AGENT_GATEWAY_URL}/agents/${encodeURIComponent(String(agent_id))}/sessions/${encodeURIComponent(String(session_id))}`,
+          { headers: authHeaders },
+          15000
+        );
+
+        let contextSummary = "";
+        if (sessionDetailsResponse.ok) {
+          const details = await sessionDetailsResponse.json() as any;
+          const recentMessages: any[] = Array.isArray(details?.messages) ? details.messages.slice(-6) : [];
+          const summarized = recentMessages
+            .map((m: any) => `${m.role || "unknown"}: ${String(m.content || "").slice(0, 280)}`)
+            .join("\n");
+          if (summarized) contextSummary = summarized;
         }
-      } else {
-        // Fallback: try parsing as JSON response
-        try {
-          const jsonResp = JSON.parse(responseText) as any;
-          accumulatedText = jsonResp.text || jsonResp.response || jsonResp.content || responseText;
-          cost = jsonResp.cost;
-        } catch {
-          accumulatedText = responseText; // raw text fallback
-        }
-      }
 
-      if (!accumulatedText && responseText.length > 0) {
-        // Last resort: return raw response info for debugging
-        accumulatedText = `[No text extracted from response. Raw length: ${responseText.length}, starts with: ${responseText.slice(0, 100)}]`;
-      }
+        const recoveredSessionId = await createSession(String(agent_id), model);
+        const recoveryPrompt = [
+          "Continue the previous session after a transport state reset.",
+          contextSummary ? `Recent context:\n${contextSummary}` : "Recent context unavailable.",
+          `User follow-up:\n${String(message)}`,
+        ].join("\n\n");
 
-      return { success: true, agent_id, session_id, text: accumulatedText, cost, message: `Session "${session_id}" resumed.` };
+        const recoveredChat = await sendChat(String(agent_id), recoveredSessionId, recoveryPrompt, model);
+        return {
+          success: true,
+          recovered: true,
+          previous_session_id: session_id,
+          session_id: recoveredSessionId,
+          agent_id,
+          text: recoveredChat.text,
+          cost: recoveredChat.cost,
+          message: `Recovered from session state mismatch by creating session "${recoveredSessionId}".`,
+        };
+      }
     }
 
     case "agent_delete_session": {
@@ -1269,7 +1662,7 @@ async function handleA2ATool(name: string, args: Record<string, any>, marketplac
         card.total_skills = totalSkills;
       }
       // Strip verbose capability details
-      if (card.capabilities) {
+      if (card.capabilities && !Array.isArray(card.capabilities)) {
         card.capabilities = Object.keys(card.capabilities);
       }
       return card;
@@ -1381,7 +1774,12 @@ async function handleWalletTool(name: string, args: Record<string, any>, marketp
       const txData = await response.json() as any;
       // Compact transaction output
       const transactions = (txData.transactions || txData || []).slice(0, args.limit || 5);
-      return { transactions, count: transactions.length };
+      return {
+        transactions,
+        count: transactions.length,
+        ...(typeof txData.total === "number" ? { total: txData.total } : {}),
+        ...(typeof txData.hasMore === "boolean" ? { hasMore: txData.hasMore } : {}),
+      };
     }
 
     case "wallet_apikey_status": {
