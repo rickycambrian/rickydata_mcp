@@ -365,25 +365,55 @@ export class MarketplaceManager {
     return serverName.toLowerCase().replace(/[/._\s]+/g, "-");
   }
 
-  /** Resolve a server_id (name or UUID) to a gateway UUID and display name. */
+  /** Resolve a server_id (name, slug, or UUID) to a gateway UUID and display name. */
   private async resolveServerId(serverId: string): Promise<{ uuid: string; name: string } | null> {
     const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(serverId);
     if (isUUID) return { uuid: serverId, name: serverId };
 
-    // Search marketplace to resolve name → UUID
-    const searchResult = await this.callGateway("gateway__search_servers", { query: serverId });
-    const servers: any[] = searchResult?.servers || [];
-    if (servers.length === 0) return null;
-
     const lowerInput = serverId.toLowerCase();
-    const match = servers.find((s: any) =>
-      s.name?.toLowerCase() === lowerInput ||
-      s.title?.toLowerCase() === lowerInput ||
-      this.deriveGatewayPrefix(s.name || "") === lowerInput
-    );
 
-    const selected = match || servers[0];
-    return { uuid: selected.id, name: selected.name || selected.title || serverId };
+    // Try multiple search queries to handle slugs, display names, and partial names
+    const queries = [serverId];
+    // If it looks like a slug (has hyphens), convert to words for search
+    if (serverId.includes("-")) {
+      // "knowair-weather-mcp" → "knowair weather mcp"
+      queries.push(serverId.replace(/-/g, " "));
+      // Also try first word: "knowair"
+      const firstWord = serverId.split("-")[0];
+      if (firstWord.length >= 3) queries.push(firstWord);
+    }
+
+    for (const query of queries) {
+      const searchResult = await this.callGateway("gateway__search_servers", { query });
+      const servers: any[] = searchResult?.servers || [];
+      if (servers.length === 0) continue;
+
+      // Try exact match first
+      const match = servers.find((s: any) =>
+        s.name?.toLowerCase() === lowerInput ||
+        s.title?.toLowerCase() === lowerInput ||
+        this.deriveGatewayPrefix(s.name || "") === lowerInput
+      );
+
+      const selected = match || servers[0];
+      return { uuid: selected.id, name: selected.name || selected.title || serverId };
+    }
+
+    // Last resort: check gateway__list_enabled for already-enabled servers
+    try {
+      const enabledResult = await this.callGateway("gateway__list_enabled", {});
+      const enabledServers: any[] = enabledResult?.servers || [];
+      const enabledMatch = enabledServers.find((s: any) =>
+        s.name?.toLowerCase() === lowerInput ||
+        s.title?.toLowerCase() === lowerInput ||
+        this.deriveGatewayPrefix(s.name || "") === lowerInput
+      );
+      if (enabledMatch) {
+        return { uuid: enabledMatch.id, name: enabledMatch.name || enabledMatch.title || serverId };
+      }
+    } catch (_) { /* ignore */ }
+
+    return null;
   }
 
   async handleEnableServer(args: { server_id: string }): Promise<any> {
