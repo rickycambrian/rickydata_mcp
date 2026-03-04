@@ -275,6 +275,30 @@ const CANVAS_TOOLS = [
       required: ["workflow_id", "node_id"]
     }
   },
+  {
+    name: "canvas_approve_gate",
+    description: "Approve or reject an approval gate in a running workflow. Use canvas_get_workflow_run to find pending approvals.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        run_id: { type: "string", description: "Run ID of the workflow" },
+        approval_id: { type: "string", description: "Approval ID from the run's approvals array" },
+        decision: { type: "string", enum: ["approve", "reject"], description: "Whether to approve or reject" }
+      },
+      required: ["run_id", "approval_id", "decision"]
+    }
+  },
+  {
+    name: "canvas_cancel_workflow",
+    description: "Get cancellation options for a running workflow. Shows current status and pending approvals that can be rejected to stop execution.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        run_id: { type: "string", description: "Run ID of the workflow to cancel" }
+      },
+      required: ["run_id"]
+    }
+  },
 ];
 
 const AGENT_TOOLS = [
@@ -308,10 +332,137 @@ const AGENT_TOOLS = [
       },
       required: ["agent_id", "message"]
     }
-  }
+  },
+  {
+    name: "agent_list_sessions",
+    description: "List chat sessions for an agent.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent_id: { type: "string", description: "Agent ID" }
+      },
+      required: ["agent_id"]
+    }
+  },
+  {
+    name: "agent_get_session",
+    description: "Get details of a specific chat session including message history.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent_id: { type: "string", description: "Agent ID" },
+        session_id: { type: "string", description: "Session ID" }
+      },
+      required: ["agent_id", "session_id"]
+    }
+  },
+  {
+    name: "agent_resume_session",
+    description: "Resume an existing chat session by sending a new message. Unlike agent_chat, this requires an existing session_id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent_id: { type: "string", description: "Agent ID" },
+        session_id: { type: "string", description: "Session ID to resume" },
+        message: { type: "string", description: "Message to send" },
+        model: { type: "string", description: "Model: 'haiku', 'sonnet', or 'opus'" }
+      },
+      required: ["agent_id", "session_id", "message"]
+    }
+  },
+  {
+    name: "agent_delete_session",
+    description: "Delete a chat session.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent_id: { type: "string", description: "Agent ID" },
+        session_id: { type: "string", description: "Session ID to delete" }
+      },
+      required: ["agent_id", "session_id"]
+    }
+  },
 ];
 
-const TOOLS = [...CANVAS_TOOLS, ...AGENT_TOOLS, ...MARKETPLACE_TOOLS];
+const A2A_TOOLS = [
+  {
+    name: "a2a_get_agent_card",
+    description: "Get the A2A agent card with capabilities, skills, and discovery info.",
+    inputSchema: { type: "object", properties: {} }
+  },
+  {
+    name: "a2a_send_message",
+    description: "Send a message via the A2A protocol. Returns a task with status and results.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        message: { type: "string", description: "Message text to send" },
+        context_id: { type: "string", description: "Optional context ID for conversation continuity" },
+        blocking: { type: "boolean", description: "Wait for completion (default: true)" }
+      },
+      required: ["message"]
+    }
+  },
+  {
+    name: "a2a_get_task",
+    description: "Get status and results of an A2A task.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "Task ID" }
+      },
+      required: ["task_id"]
+    }
+  },
+  {
+    name: "a2a_list_tasks",
+    description: "List A2A tasks with optional filters.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "number", description: "Max results (default: 20)" },
+        status: { type: "string", description: "Filter by status: submitted, working, completed, failed, canceled" },
+        context_id: { type: "string", description: "Filter by context ID" }
+      }
+    }
+  },
+  {
+    name: "a2a_cancel_task",
+    description: "Cancel a running A2A task.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "Task ID to cancel" }
+      },
+      required: ["task_id"]
+    }
+  },
+];
+
+const WALLET_TOOLS = [
+  {
+    name: "wallet_get_balance",
+    description: "Get wallet USDC and ETH balance on Base network.",
+    inputSchema: { type: "object", properties: {} }
+  },
+  {
+    name: "wallet_get_transactions",
+    description: "Get recent wallet transactions and payment history.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "number", description: "Max results (default: 20)" }
+      }
+    }
+  },
+  {
+    name: "wallet_apikey_status",
+    description: "Check if an Anthropic API key is configured for BYOK agents.",
+    inputSchema: { type: "object", properties: {} }
+  },
+];
+
+const TOOLS = [...CANVAS_TOOLS, ...AGENT_TOOLS, ...A2A_TOOLS, ...WALLET_TOOLS, ...MARKETPLACE_TOOLS];
 
 // ============================================================================
 // CANVAS TOOL HANDLERS
@@ -343,7 +494,7 @@ function parseSSEResult(sseText: string): any {
         status = event.data?.status || "failed";
       }
       if (event.type === "error") status = "failed";
-    } catch { /* skip malformed lines */ }
+    } catch (e) { console.error("[sse] Dropped malformed SSE line:", dataStr?.slice(0, 200)); }
   }
 
   return { runId, status, results, logs, event_count: events.length };
@@ -375,7 +526,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       const response = await fetchWithTimeout(
         `${CANVAS_API_URL}/canvas/workflows/execute/stream`,
         { method: "POST", headers, body: JSON.stringify(args) },
-        30000
+        300000
       );
       if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
       const sseText = await response.text();
@@ -446,8 +597,13 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       const searchTerm = args.workflow_id || args.workflow_name || "unknown";
       if (!wf) throw new Error(`Workflow "${searchTerm}" not found`);
 
-      const nodes = typeof wf.nodesJson === "string" ? JSON.parse(wf.nodesJson) : (wf.nodes || []);
-      const edges = typeof wf.edgesJson === "string" ? JSON.parse(wf.edgesJson) : (wf.edges || []);
+      let nodes: any[], edges: any[];
+      try {
+        nodes = typeof wf.nodesJson === "string" ? JSON.parse(wf.nodesJson) : (wf.nodes || []);
+        edges = typeof wf.edgesJson === "string" ? JSON.parse(wf.edgesJson) : (wf.edges || []);
+      } catch (e) {
+        throw new Error("Workflow nodes/edges JSON is corrupted: " + (e as Error).message);
+      }
       if (!Array.isArray(nodes) || nodes.length === 0) throw new Error(`Workflow "${searchTerm}" has no nodes`);
       const request: Record<string, any> = {
         nodes: nodes.map((n: any) => ({ id: n.id, type: n.type, data: n.data })),
@@ -482,8 +638,13 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       const searchTerm = args.workflow_id || args.workflow_name || "unknown";
       if (!wf) throw new Error(`Workflow "${searchTerm}" not found`);
 
-      const nodes = typeof wf.nodesJson === "string" ? JSON.parse(wf.nodesJson) : (wf.nodes || []);
-      const edges = typeof wf.edgesJson === "string" ? JSON.parse(wf.edgesJson) : (wf.edges || []);
+      let nodes: any[], edges: any[];
+      try {
+        nodes = typeof wf.nodesJson === "string" ? JSON.parse(wf.nodesJson) : (wf.nodes || []);
+        edges = typeof wf.edgesJson === "string" ? JSON.parse(wf.edgesJson) : (wf.edges || []);
+      } catch (e) {
+        throw new Error("Workflow nodes/edges JSON is corrupted: " + (e as Error).message);
+      }
       if (!Array.isArray(nodes) || nodes.length === 0) throw new Error(`Workflow "${searchTerm}" has no nodes`);
       const request: Record<string, any> = {
         nodes: nodes.map((n: any) => ({ id: n.id, type: n.type, data: n.data })),
@@ -576,7 +737,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       // Find a suitable agent
       const agentsResponse = await fetchWithTimeout(
         `${AGENT_GATEWAY_URL}/agents`,
-        { headers: { "Content-Type": "application/json" } },
+        { headers: { "Content-Type": "application/json", ...(token ? { "Authorization": `Bearer ${token}` } : {}) } },
         15000
       );
       if (!agentsResponse.ok) throw new Error(`Failed to list agents: ${agentsResponse.status}`);
@@ -652,8 +813,13 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       const wf = workflows.find((w: any) => w.entityId === args.workflow_id || w.name === args.workflow_id);
       if (!wf) throw new Error(`Workflow "${args.workflow_id}" not found`);
 
-      const existingNodes = typeof wf.nodesJson === "string" ? JSON.parse(wf.nodesJson) : (wf.nodes || []);
-      const existingEdges = typeof wf.edgesJson === "string" ? JSON.parse(wf.edgesJson) : (wf.edges || []);
+      let existingNodes: any[], existingEdges: any[];
+      try {
+        existingNodes = typeof wf.nodesJson === "string" ? JSON.parse(wf.nodesJson) : (wf.nodes || []);
+        existingEdges = typeof wf.edgesJson === "string" ? JSON.parse(wf.edgesJson) : (wf.edges || []);
+      } catch (e) {
+        throw new Error("Workflow nodes/edges JSON is corrupted: " + (e as Error).message);
+      }
 
       const savePayload: Record<string, any> = {
         name: args.name || wf.name,
@@ -673,7 +839,7 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       return {
         success: true,
         previous_id: args.workflow_id,
-        new_entity_id: saved.entityId || saved.id,
+        new_entity_id: saved.entityId || saved.id || saved.workflow?.entityId || saved.workflow?.id || "check canvas_get_workflows for new version",
         name: savePayload.name,
         message: "Saved as new version (Geo storage is immutable). Use the new entityId for future references."
       };
@@ -692,8 +858,13 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       const wf = workflows.find((w: any) => w.entityId === args.workflow_id || w.name === args.workflow_id);
       if (!wf) throw new Error(`Workflow "${args.workflow_id}" not found`);
 
-      const nodes = typeof wf.nodesJson === "string" ? JSON.parse(wf.nodesJson) : (wf.nodes || []);
-      const edges = typeof wf.edgesJson === "string" ? JSON.parse(wf.edgesJson) : (wf.edges || []);
+      let nodes: any[], edges: any[];
+      try {
+        nodes = typeof wf.nodesJson === "string" ? JSON.parse(wf.nodesJson) : (wf.nodes || []);
+        edges = typeof wf.edgesJson === "string" ? JSON.parse(wf.edgesJson) : (wf.edges || []);
+      } catch (e) {
+        throw new Error("Workflow nodes/edges JSON is corrupted: " + (e as Error).message);
+      }
 
       const targetNode = nodes.find((n: any) => n.id === args.node_id);
       if (!targetNode) throw new Error(`Node "${args.node_id}" not found in workflow "${args.workflow_id}"`);
@@ -721,9 +892,46 @@ async function handleCanvasTool(name: string, args: Record<string, any>, marketp
       return {
         success: true,
         previous_id: args.workflow_id,
-        new_entity_id: saved.entityId || saved.id,
+        new_entity_id: saved.entityId || saved.id || saved.workflow?.entityId || saved.workflow?.id || "check canvas_get_workflows for new version",
         updated_node_id: args.node_id,
         message: "Node updated and saved as new version (Geo storage is immutable)."
+      };
+    }
+
+    case "canvas_approve_gate": {
+      const response = await fetchWithTimeout(
+        `${CANVAS_API_URL}/canvas/runs/${encodeURIComponent(args.run_id)}/approvals/${encodeURIComponent(args.approval_id)}`,
+        { method: "POST", headers, body: JSON.stringify({ decision: args.decision }) },
+        15000
+      );
+      if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
+      let result: Record<string, any>;
+      try { result = await response.json() as Record<string, any>; } catch { result = { success: true }; }
+      return { success: true, run_id: args.run_id, approval_id: args.approval_id, decision: args.decision, ...result };
+    }
+
+    case "canvas_cancel_workflow": {
+      const response = await fetchWithTimeout(
+        `${CANVAS_API_URL}/canvas/runs/${encodeURIComponent(args.run_id)}`,
+        { headers },
+        15000
+      );
+      if (!response.ok) throw new Error(`API returned ${response.status}: ${await response.text()}`);
+      const run = await response.json() as any;
+      const pendingApprovals = (run.approvals || []).filter((a: any) => a.status === "pending");
+
+      if (run.status === "completed" || run.status === "failed") {
+        return { run_id: args.run_id, status: run.status, message: "Workflow already finished.", canCancel: false };
+      }
+
+      return {
+        run_id: args.run_id,
+        status: run.status,
+        canCancel: pendingApprovals.length > 0,
+        pendingApprovals: pendingApprovals.map((a: any) => ({ approvalId: a.approvalId, nodeId: a.nodeId, message: a.message })),
+        message: pendingApprovals.length > 0
+          ? `Workflow is ${run.status}. Reject ${pendingApprovals.length} pending approval(s) with canvas_approve_gate to stop execution.`
+          : `Workflow is ${run.status}. No pending approvals to reject. Workflow will complete or timeout on its own.`
       };
     }
 
@@ -743,7 +951,10 @@ async function handleAgentTool(name: string, args: Record<string, any>, marketpl
     case "agent_list": {
       const response = await fetchWithTimeout(
         `${AGENT_GATEWAY_URL}/agents`,
-        { headers: { "Content-Type": "application/json" } },
+        { headers: {
+          "Content-Type": "application/json",
+          ...(token ? { "Authorization": `Bearer ${token}` } : {})
+        } },
         15000
       );
       if (!response.ok) throw new Error(`Agent Gateway returned ${response.status}: ${await response.text()}`);
@@ -826,7 +1037,7 @@ async function handleAgentTool(name: string, args: Record<string, any>, marketpl
           }
         } catch (e) {
           if (e instanceof Error && e.message.startsWith("Agent error:")) throw e;
-          /* skip malformed SSE lines */
+          console.error("[sse] Dropped malformed SSE line:", dataStr?.slice(0, 200));
         }
       }
 
@@ -840,8 +1051,219 @@ async function handleAgentTool(name: string, args: Record<string, any>, marketpl
       };
     }
 
+    case "agent_list_sessions": {
+      if (!token) return { success: false, error: "No auth token available." };
+      const response = await fetchWithTimeout(
+        `${AGENT_GATEWAY_URL}/agents/${encodeURIComponent(args.agent_id)}/sessions`,
+        { headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` } },
+        15000
+      );
+      if (!response.ok) throw new Error(`Failed to list sessions: ${response.status} ${await response.text()}`);
+      const data = await response.json() as any;
+      return { success: true, agent_id: args.agent_id, sessions: data.sessions || data || [], count: (data.sessions || data || []).length };
+    }
+
+    case "agent_get_session": {
+      if (!token) return { success: false, error: "No auth token available." };
+      const response = await fetchWithTimeout(
+        `${AGENT_GATEWAY_URL}/agents/${encodeURIComponent(args.agent_id)}/sessions/${encodeURIComponent(args.session_id)}`,
+        { headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` } },
+        15000
+      );
+      if (!response.ok) throw new Error(`Failed to get session: ${response.status} ${await response.text()}`);
+      const data = await response.json() as any;
+      return { success: true, ...data };
+    }
+
+    case "agent_resume_session": {
+      if (!token) return { success: false, error: "No auth token available." };
+      const { agent_id, session_id, message, model = "haiku" } = args;
+      const chatResponse = await fetchWithTimeout(
+        `${AGENT_GATEWAY_URL}/agents/${encodeURIComponent(agent_id)}/sessions/${encodeURIComponent(session_id)}/chat`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}`, "Accept": "text/event-stream" },
+          body: JSON.stringify({ message, model })
+        },
+        300000
+      );
+      if (!chatResponse.ok) throw new Error(`Chat failed: ${chatResponse.status} ${await chatResponse.text()}`);
+      const responseText = await chatResponse.text();
+      let accumulatedText = "";
+      let cost: string | undefined;
+      for (const line of responseText.split("\n")) {
+        if (!line.startsWith("data: ") && !line.startsWith("data:")) continue;
+        const dataStr = line.startsWith("data: ") ? line.slice(6) : line.slice(5);
+        if (dataStr === "[DONE]") break;
+        try {
+          const event = JSON.parse(dataStr) as any;
+          if (event.type === "text") {
+            if (typeof event.data === "string") accumulatedText += event.data;
+            else if (event.data?.text) accumulatedText += event.data.text;
+          }
+          if (event.type === "content_block_delta" && event.delta?.text) accumulatedText += event.delta.text;
+          if (event.type === "done" && event.data?.cost) cost = event.data.cost;
+          if (event.type === "usage" && event.data?.cost) cost = event.data.cost;
+          if (event.type === "error") throw new Error(`Agent error: ${event.data?.message || JSON.stringify(event.data)}`);
+        } catch (e) {
+          if (e instanceof Error && e.message.startsWith("Agent error:")) throw e;
+          console.error("[sse] Dropped malformed SSE line:", dataStr?.slice(0, 200));
+        }
+      }
+      return { success: true, agent_id, session_id, text: accumulatedText, cost, message: `Session "${session_id}" resumed.` };
+    }
+
+    case "agent_delete_session": {
+      if (!token) return { success: false, error: "No auth token available." };
+      const response = await fetchWithTimeout(
+        `${AGENT_GATEWAY_URL}/agents/${encodeURIComponent(args.agent_id)}/sessions/${encodeURIComponent(args.session_id)}`,
+        { method: "DELETE", headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` } },
+        15000
+      );
+      if (!response.ok) throw new Error(`Failed to delete session: ${response.status} ${await response.text()}`);
+      let result: Record<string, any>;
+      try { result = await response.json() as Record<string, any>; } catch { result = { success: true }; }
+      return { success: true, agent_id: args.agent_id, session_id: args.session_id, ...result, message: "Session deleted." };
+    }
+
     default:
       throw new Error(`Unknown agent tool: ${name}`);
+  }
+}
+
+// ============================================================================
+// A2A TOOL HANDLERS
+// ============================================================================
+
+async function handleA2ATool(name: string, args: Record<string, any>, marketplace: MarketplaceManager): Promise<any> {
+  const token = marketplace.getUserToken();
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "A2A-Version": "0.3",
+    ...(token ? { "Authorization": `Bearer ${token}` } : {})
+  };
+
+  switch (name) {
+    case "a2a_get_agent_card": {
+      const response = await fetchWithTimeout(
+        `${AGENT_GATEWAY_URL}/.well-known/agent.json`,
+        { headers: { "Accept": "application/json" } },
+        15000
+      );
+      if (!response.ok) throw new Error(`Failed to get agent card: ${response.status} ${await response.text()}`);
+      return await response.json();
+    }
+
+    case "a2a_send_message": {
+      if (!token) throw new Error("No auth token. Authenticate with a wallet token first.");
+      const body = {
+        message: {
+          role: "user",
+          parts: [{ type: "text", text: args.message }]
+        },
+        configuration: {
+          blocking: args.blocking !== false,
+          ...(args.context_id ? { contextId: args.context_id } : {})
+        }
+      };
+      const response = await fetchWithTimeout(
+        `${AGENT_GATEWAY_URL}/a2a/messages`,
+        { method: "POST", headers, body: JSON.stringify(body) },
+        300000
+      );
+      if (!response.ok) throw new Error(`A2A message failed: ${response.status} ${await response.text()}`);
+      return await response.json();
+    }
+
+    case "a2a_get_task": {
+      if (!token) throw new Error("No auth token. Authenticate with a wallet token first.");
+      const response = await fetchWithTimeout(
+        `${AGENT_GATEWAY_URL}/a2a/tasks/${encodeURIComponent(args.task_id)}`,
+        { headers },
+        15000
+      );
+      if (!response.ok) throw new Error(`Failed to get task: ${response.status} ${await response.text()}`);
+      return await response.json();
+    }
+
+    case "a2a_list_tasks": {
+      if (!token) throw new Error("No auth token. Authenticate with a wallet token first.");
+      const params = new URLSearchParams();
+      if (args.limit) params.append("limit", String(args.limit));
+      if (args.status) params.append("status", args.status);
+      if (args.context_id) params.append("contextId", args.context_id);
+      const response = await fetchWithTimeout(
+        `${AGENT_GATEWAY_URL}/a2a/tasks?${params}`,
+        { headers },
+        15000
+      );
+      if (!response.ok) throw new Error(`Failed to list tasks: ${response.status} ${await response.text()}`);
+      return await response.json();
+    }
+
+    case "a2a_cancel_task": {
+      if (!token) throw new Error("No auth token. Authenticate with a wallet token first.");
+      const response = await fetchWithTimeout(
+        `${AGENT_GATEWAY_URL}/a2a/tasks/${encodeURIComponent(args.task_id)}:cancel`,
+        { method: "POST", headers },
+        15000
+      );
+      if (!response.ok) throw new Error(`Failed to cancel task: ${response.status} ${await response.text()}`);
+      return await response.json();
+    }
+
+    default:
+      throw new Error(`Unknown A2A tool: ${name}`);
+  }
+}
+
+// ============================================================================
+// WALLET TOOL HANDLERS
+// ============================================================================
+
+async function handleWalletTool(name: string, args: Record<string, any>, marketplace: MarketplaceManager): Promise<any> {
+  const token = marketplace.getUserToken();
+  if (!token) throw new Error("No auth token. Authenticate with a wallet token first.");
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Authorization": `Bearer ${token}`
+  };
+
+  switch (name) {
+    case "wallet_get_balance": {
+      const response = await fetchWithTimeout(
+        `${AGENT_GATEWAY_URL}/wallet/balance`,
+        { headers },
+        15000
+      );
+      if (!response.ok) throw new Error(`Failed to get balance: ${response.status} ${await response.text()}`);
+      return await response.json();
+    }
+
+    case "wallet_get_transactions": {
+      const params = new URLSearchParams();
+      if (args.limit) params.append("limit", String(args.limit));
+      const response = await fetchWithTimeout(
+        `${AGENT_GATEWAY_URL}/wallet/transactions?${params}`,
+        { headers },
+        15000
+      );
+      if (!response.ok) throw new Error(`Failed to get transactions: ${response.status} ${await response.text()}`);
+      return await response.json();
+    }
+
+    case "wallet_apikey_status": {
+      const response = await fetchWithTimeout(
+        `${AGENT_GATEWAY_URL}/wallet/apikey/status`,
+        { headers },
+        15000
+      );
+      if (!response.ok) throw new Error(`Failed to get API key status: ${response.status} ${await response.text()}`);
+      return await response.json();
+    }
+
+    default:
+      throw new Error(`Unknown wallet tool: ${name}`);
   }
 }
 
@@ -937,6 +1359,10 @@ function setupMCPHandlers(server: Server, marketplace: MarketplaceManager): void
         result = await handleCanvasTool(name, args, marketplace);
       } else if (name.startsWith("agent_")) {
         result = await handleAgentTool(name, args, marketplace);
+      } else if (name.startsWith("a2a_")) {
+        result = await handleA2ATool(name, args, marketplace);
+      } else if (name.startsWith("wallet_")) {
+        result = await handleWalletTool(name, args, marketplace);
       } else if (name === "marketplace_search") {
         result = await marketplace.handleSearch(args as any);
       } else if (name === "marketplace_server_info") {
@@ -1039,6 +1465,10 @@ if (isStdio) {
         result = await handleCanvasTool(name, args, stdioMarketplace);
       } else if (name.startsWith("agent_")) {
         result = await handleAgentTool(name, args, stdioMarketplace);
+      } else if (name.startsWith("a2a_")) {
+        result = await handleA2ATool(name, args, stdioMarketplace);
+      } else if (name.startsWith("wallet_")) {
+        result = await handleWalletTool(name, args, stdioMarketplace);
       } else if (name === "marketplace_search") {
         result = await stdioMarketplace.handleSearch(args as any);
       } else if (name === "marketplace_server_info") {
