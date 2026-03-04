@@ -8,6 +8,9 @@ import cors from "cors";
 import rateLimit from "express-rate-limit";
 import { verifyWalletToken, WALLET_TOKEN_PREFIX } from "./wallet-token.js";
 import { MarketplaceManager, MARKETPLACE_TOOLS } from "./marketplace.js";
+import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import { RickydataOAuthProvider, oauthCompleteHandler, oauthCallbackHandler, pruneOAuthStores } from "./oauth.js";
 
 // ============================================================================
 // CONFIGURATION
@@ -28,6 +31,7 @@ const AGENT_RESUME_WAIT_SECONDS = parseInt(process.env.AGENT_RESUME_WAIT_SECONDS
 const AGENT_STATUS_POLL_INTERVAL_MS = parseInt(process.env.AGENT_STATUS_POLL_INTERVAL_MS || "3000", 10);
 const AGENT_STATUS_POLL_MAX_MS = parseInt(process.env.AGENT_STATUS_POLL_MAX_MS || "90000", 10);
 const MAX_CITATION_VALIDATIONS = parseInt(process.env.MAX_CITATION_VALIDATIONS || "12", 10);
+const SERVER_BASE_URL = process.env.SERVER_BASE_URL || "https://rickydata-mcp-server-2dbp4scmrq-uc.a.run.app";
 
 interface WorkflowLike {
   entityId?: string;
@@ -2847,31 +2851,29 @@ app.use(rateLimit({ windowMs: 1 * 60 * 1000, max: 1000, ...rlOpts }));
 app.use(rateLimit({ windowMs: 10 * 60 * 1000, max: 10000, ...rlOpts }));
 app.use(rateLimit({ windowMs: 60 * 60 * 1000, max: 50000, ...rlOpts }));
 
-// Auth middleware — wallet tokens only
-// Users authenticate via `rickydata auth login` and connect via `rickydata mcp connect-server`
-const authMiddleware: express.RequestHandler = (req, res, next) => {
-  const authHeader = req.headers["authorization"] || "";
-  const token = typeof authHeader === "string" ? authHeader.replace("Bearer ", "") : "";
+// OAuth 2.0 provider — bridges MCP SDK's OAuth framework to wallet tokens
+const oauthProvider = new RickydataOAuthProvider();
+const serverBaseUrl = new URL(SERVER_BASE_URL);
+const resourceMetadataUrl = `${SERVER_BASE_URL}/.well-known/oauth-protected-resource/mcp`;
 
-  if (!token) {
-    res.status(401).json({ error: "Missing Authorization header. Run `rickydata auth login` then `rickydata mcp connect-server`." });
-    return;
-  }
+app.use(mcpAuthRouter({
+  provider: oauthProvider,
+  issuerUrl: serverBaseUrl,
+  baseUrl: serverBaseUrl,
+  resourceServerUrl: new URL(`${SERVER_BASE_URL}/mcp`),
+  resourceName: "rickydata MCP Server",
+}));
 
-  if (!token.startsWith(WALLET_TOKEN_PREFIX)) {
-    res.status(403).json({ error: "Invalid token format. Use a wallet token (mcpwt_). Run `rickydata auth login`." });
-    return;
-  }
+// Custom OAuth endpoints for marketplace login flow
+app.post("/oauth/complete", oauthCompleteHandler());
+app.get("/oauth/callback", oauthCallbackHandler());
 
-  const result = verifyWalletToken(token);
-  if (!result) {
-    res.status(403).json({ error: "Invalid or expired wallet token. Run `rickydata auth login` to get a new one." });
-    return;
-  }
-
-  (req as any).user = `wallet:${result.walletAddress}`;
-  next();
-};
+// Auth middleware — uses SDK's requireBearerAuth which returns proper WWW-Authenticate
+// headers on 401 (required by Claude.ai). Validates wallet tokens via oauthProvider.verifyAccessToken.
+const authMiddleware = requireBearerAuth({
+  verifier: oauthProvider,
+  resourceMetadataUrl,
+});
 
 // Health check
 app.get("/health", (_req, res) => {
@@ -2911,6 +2913,7 @@ setInterval(() => {
   }
   pruneRunTailCache(now);
   pruneAgentResumeStatusCache(now);
+  pruneOAuthStores(now);
 }, 5 * 60 * 1000);
 
 function setupMCPHandlers(server: Server, marketplace: MarketplaceManager): void {
