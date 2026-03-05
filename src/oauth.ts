@@ -49,7 +49,7 @@ function getTokenExpiry(token: string): number | undefined {
 const MARKETPLACE_URL =
   process.env.MARKETPLACE_URL || "https://mcpmarketplace.rickydata.org";
 const SERVER_BASE_URL =
-  process.env.SERVER_BASE_URL || "https://rickydata-mcp-server-2dbp4scmrq-uc.a.run.app";
+  process.env.SERVER_BASE_URL || "https://connect.rickydata.org";
 
 // TTLs
 const CLIENT_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days

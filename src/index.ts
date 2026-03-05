@@ -31,7 +31,7 @@ const AGENT_RESUME_WAIT_SECONDS = parseInt(process.env.AGENT_RESUME_WAIT_SECONDS
 const AGENT_STATUS_POLL_INTERVAL_MS = parseInt(process.env.AGENT_STATUS_POLL_INTERVAL_MS || "3000", 10);
 const AGENT_STATUS_POLL_MAX_MS = parseInt(process.env.AGENT_STATUS_POLL_MAX_MS || "90000", 10);
 const MAX_CITATION_VALIDATIONS = parseInt(process.env.MAX_CITATION_VALIDATIONS || "12", 10);
-const SERVER_BASE_URL = process.env.SERVER_BASE_URL || "https://rickydata-mcp-server-2dbp4scmrq-uc.a.run.app";
+const SERVER_BASE_URL = process.env.SERVER_BASE_URL || "https://connect.rickydata.org";
 
 interface WorkflowLike {
   entityId?: string;
