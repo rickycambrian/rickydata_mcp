@@ -69,10 +69,24 @@ jobs:
           --region ${{ env.REGION }} \
           --project ${{ secrets.GCP_PROJECT_ID }} \
           --format 'value(status.url)')
+        echo "SERVICE_URL=$SERVICE_URL" >> $GITHUB_ENV
         echo "Service deployed successfully!"
         echo "Service URL: $SERVICE_URL"
 
     - name: Test Deployment
       run: |
         sleep 10
-        curl -f "${{ env.SERVICE_URL }}/health" || echo "Health check not available yet"
+        if [ -z "${SERVICE_URL:-}" ]; then
+          echo "SERVICE_URL is missing"
+          exit 1
+        fi
+        curl -fsS "${SERVICE_URL}/health" | jq -e '.status == "healthy"' >/dev/null
+
+    - name: Verify gateway managed relay compatibility
+      run: |
+        curl -fsS "https://mcp.rickydata.org/api/payments/config" | jq '{
+          enabled,
+          managedRelayEnabled,
+          managedRelayMode,
+          topUpUrl
+        }'

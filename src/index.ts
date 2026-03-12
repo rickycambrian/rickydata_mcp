@@ -8,6 +8,11 @@ import cors from "cors";
 import rateLimit from "express-rate-limit";
 import { verifyWalletToken, WALLET_TOKEN_PREFIX } from "./wallet-token.js";
 import { MarketplaceManager, MARKETPLACE_TOOLS } from "./marketplace.js";
+import {
+  getAnswerSheetToolDefinitions,
+  isAnswerSheetTool,
+  handleAnswerSheetTool,
+} from "./answer-sheet-tools.js";
 import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { RickydataOAuthProvider, oauthCompleteHandler, oauthCallbackHandler, pruneOAuthStores } from "./oauth.js";
@@ -1201,7 +1206,7 @@ const WALLET_TOOLS = [
   },
 ];
 
-const TOOLS = [...CANVAS_TOOLS, ...AGENT_TOOLS, ...A2A_TOOLS, ...WALLET_TOOLS, ...MARKETPLACE_TOOLS];
+const TOOLS = [...CANVAS_TOOLS, ...AGENT_TOOLS, ...A2A_TOOLS, ...WALLET_TOOLS, ...MARKETPLACE_TOOLS, ...getAnswerSheetToolDefinitions()];
 
 // ============================================================================
 // CANVAS TOOL HANDLERS
@@ -2946,6 +2951,8 @@ function setupMCPHandlers(server: Server, marketplace: MarketplaceManager): void
         result = await marketplace.handleListEnabled();
       } else if (marketplace.isDynamicTool(name)) {
         result = await marketplace.handleDynamicToolCall(name, args);
+      } else if (isAnswerSheetTool(name)) {
+        result = await handleAnswerSheetTool(name, args);
       } else {
         result = { error: `Unknown tool: ${name}` };
       }
@@ -3052,6 +3059,8 @@ if (isStdio) {
         result = await stdioMarketplace.handleListEnabled();
       } else if (stdioMarketplace.isDynamicTool(name)) {
         result = await stdioMarketplace.handleDynamicToolCall(name, args);
+      } else if (isAnswerSheetTool(name)) {
+        result = await handleAnswerSheetTool(name, args);
       } else {
         result = { error: `Unknown tool: ${name}` };
       }
