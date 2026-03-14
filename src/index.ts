@@ -13,6 +13,11 @@ import {
   isAnswerSheetTool,
   handleAnswerSheetTool,
 } from "./answer-sheet-tools.js";
+import {
+  getCodeIntelligenceToolDefinitions,
+  isCodeIntelligenceTool,
+  handleCodeIntelligenceTool,
+} from "./code-intelligence-tools.js";
 import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { RickydataOAuthProvider, oauthCompleteHandler, oauthCallbackHandler, pruneOAuthStores } from "./oauth.js";
@@ -1206,7 +1211,7 @@ const WALLET_TOOLS = [
   },
 ];
 
-const TOOLS = [...CANVAS_TOOLS, ...AGENT_TOOLS, ...A2A_TOOLS, ...WALLET_TOOLS, ...MARKETPLACE_TOOLS, ...getAnswerSheetToolDefinitions()];
+const TOOLS = [...CANVAS_TOOLS, ...AGENT_TOOLS, ...A2A_TOOLS, ...WALLET_TOOLS, ...MARKETPLACE_TOOLS, ...getAnswerSheetToolDefinitions(), ...getCodeIntelligenceToolDefinitions()];
 
 // ============================================================================
 // CANVAS TOOL HANDLERS
@@ -2953,6 +2958,8 @@ function setupMCPHandlers(server: Server, marketplace: MarketplaceManager): void
         result = await marketplace.handleDynamicToolCall(name, args);
       } else if (isAnswerSheetTool(name)) {
         result = await handleAnswerSheetTool(name, args);
+      } else if (isCodeIntelligenceTool(name)) {
+        result = await handleCodeIntelligenceTool(name, args);
       } else {
         result = { error: `Unknown tool: ${name}` };
       }
@@ -3061,6 +3068,8 @@ if (isStdio) {
         result = await stdioMarketplace.handleDynamicToolCall(name, args);
       } else if (isAnswerSheetTool(name)) {
         result = await handleAnswerSheetTool(name, args);
+      } else if (isCodeIntelligenceTool(name)) {
+        result = await handleCodeIntelligenceTool(name, args);
       } else {
         result = { error: `Unknown tool: ${name}` };
       }
