@@ -229,6 +229,40 @@ Action formats:
 Always include a human-readable "message" explaining what you did. Position nodes with reasonable spacing (200-300px apart).`;
 
 // ============================================================================
+// WALLET SETTINGS CACHE (per-session, avoids repeated API calls)
+// ============================================================================
+
+interface WalletSettingsCache {
+  defaultModel?: string;
+  fetchedAt: number;
+}
+
+const WALLET_SETTINGS_TTL_MS = 300_000; // 5 minutes
+let walletSettingsCache: WalletSettingsCache | null = null;
+
+async function getWalletDefaultModel(token: string): Promise<string | undefined> {
+  if (walletSettingsCache && Date.now() - walletSettingsCache.fetchedAt < WALLET_SETTINGS_TTL_MS) {
+    return walletSettingsCache.defaultModel;
+  }
+  try {
+    const response = await fetchWithTimeout(
+      `${AGENT_GATEWAY_URL}/wallet/settings`,
+      { headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` } },
+      10000
+    );
+    if (response.ok) {
+      const data = await response.json() as any;
+      walletSettingsCache = { defaultModel: data.defaultModel, fetchedAt: Date.now() };
+      return data.defaultModel;
+    }
+  } catch {
+    // Ignore — fall back to default
+  }
+  walletSettingsCache = { defaultModel: undefined, fetchedAt: Date.now() };
+  return undefined;
+}
+
+// ============================================================================
 // HELPERS
 // ============================================================================
 
@@ -2283,7 +2317,12 @@ async function handleAgentTool(name: string, args: Record<string, any>, marketpl
   }> => {
     const agentId = String(requestArgs.agent_id);
     const sessionId = String(requestArgs.session_id);
-    const model = normalizeGatewayModelName(requestArgs.model, "haiku");
+    let resumeModelFallback = "haiku";
+    if (!requestArgs.model && token) {
+      const preferred = await getWalletDefaultModel(token);
+      if (preferred) resumeModelFallback = preferred;
+    }
+    const model = normalizeGatewayModelName(requestArgs.model, resumeModelFallback);
     const qualityPolicy = normalizeResearchQualityPolicy(requestArgs.research_quality_policy, agentId);
     const trustedDomains = normalizeTrustedDomains(requestArgs.trusted_domains);
     const policyPrompt = buildResearchPolicyPrompt(qualityPolicy, trustedDomains);
@@ -2421,7 +2460,12 @@ async function handleAgentTool(name: string, args: Record<string, any>, marketpl
 
     case "agent_create_session": {
       if (!token) return { success: false, error: "No auth token available." };
-      const normalizedModel = normalizeGatewayModelName(args.model, "haiku");
+      let createModelFallback = "haiku";
+      if (!args.model && token) {
+        const preferred = await getWalletDefaultModel(token);
+        if (preferred) createModelFallback = preferred;
+      }
+      const normalizedModel = normalizeGatewayModelName(args.model, createModelFallback);
       const sessionId = await createSession(String(args.agent_id), normalizedModel);
       return { success: true, session_id: sessionId, agent_id: args.agent_id, model: normalizedModel };
     }
@@ -2429,7 +2473,13 @@ async function handleAgentTool(name: string, args: Record<string, any>, marketpl
     case "agent_chat": {
       if (!token) return { success: false, error: "No auth token available." };
       const { agent_id, message, session_id } = args;
-      const model = normalizeGatewayModelName(args.model, "haiku");
+      // Use wallet settings preferred model when user doesn't specify one
+      let modelFallback = "haiku";
+      if (!args.model && token) {
+        const preferred = await getWalletDefaultModel(token);
+        if (preferred) modelFallback = preferred;
+      }
+      const model = normalizeGatewayModelName(args.model, modelFallback);
       const qualityPolicy = normalizeResearchQualityPolicy(args.research_quality_policy, String(agent_id));
       const trustedDomains = normalizeTrustedDomains(args.trusted_domains);
       const policyPrompt = buildResearchPolicyPrompt(qualityPolicy, trustedDomains);
@@ -2769,6 +2819,27 @@ async function handleWalletTool(name: string, args: Record<string, any>, marketp
       );
       if (!response.ok) throw new Error(`Failed to get balance: ${response.status} ${await response.text()}`);
       const balance = await response.json() as any;
+
+      // Fetch free-tier status (best-effort — don't fail if endpoint missing)
+      let freeTier: { dailyRemaining?: number; dailyLimit?: number; plan?: string } | undefined;
+      try {
+        const ftResponse = await fetchWithTimeout(
+          `${AGENT_GATEWAY_URL}/wallet/free-tier/status`,
+          { headers },
+          10000
+        );
+        if (ftResponse.ok) {
+          const ftData = await ftResponse.json() as any;
+          freeTier = {
+            dailyRemaining: ftData.dailyRemaining ?? ftData.remaining,
+            dailyLimit: ftData.dailyLimit ?? ftData.limit,
+            plan: ftData.plan || (ftData.isByok ? "byok" : "free"),
+          };
+        }
+      } catch {
+        // Free-tier endpoint may not exist yet — ignore
+      }
+
       // Return compact summary — strip per-agent breakdowns
       return {
         walletAddress: balance.walletAddress || balance.address,
@@ -2776,6 +2847,7 @@ async function handleWalletTool(name: string, args: Record<string, any>, marketp
         eth: balance.eth || balance.ethBalance,
         network: balance.network || "base",
         ...(balance.totalSpent ? { totalSpent: balance.totalSpent } : {}),
+        ...(freeTier ? { freeTier } : {}),
       };
     }
 

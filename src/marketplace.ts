@@ -81,7 +81,7 @@ export const MARKETPLACE_TOOLS = [
   },
   {
     name: "marketplace_enable_server",
-    description: "Enable an MCP server from the marketplace. Adds its tools to the current session.",
+    description: "Enable an MCP server from the marketplace. Tools become available immediately via hot-reload — no server restart needed.",
     inputSchema: {
       type: "object",
       properties: {
@@ -92,7 +92,7 @@ export const MARKETPLACE_TOOLS = [
   },
   {
     name: "marketplace_disable_server",
-    description: "Disable a previously enabled MCP server. Removes its tools from the current session.",
+    description: "Disable a previously enabled MCP server. Tools are removed immediately via hot-reload — no server restart needed.",
     inputSchema: {
       type: "object",
       properties: {
