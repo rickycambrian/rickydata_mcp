@@ -3057,8 +3057,33 @@ app.post("/mcp", authMiddleware, async (req, res) => {
     const session = sessions.get(sessionId)!;
     session.marketplace.setUserToken(userToken);
     await session.transport.handleRequest(req, res, req.body);
+  } else if (sessionId && !sessions.has(sessionId)) {
+    // Stale session — client has a session ID but server lost it (restart/cold start).
+    // Create a fresh session, force-initialize it, then process the original request.
+    const newId = randomUUID();
+    const marketplace = new MarketplaceManager();
+    marketplace.setUserToken(userToken);
+
+    const server = new Server(
+      { name: "rickydata", version: "1.0.0" },
+      { capabilities: { tools: { listChanged: true } } }
+    );
+    marketplace.setServer(server);
+    setupMCPHandlers(server, marketplace);
+
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => newId });
+    await server.connect(transport);
+    sessions.set(newId, { server, transport, marketplace, createdAt: Date.now() });
+
+    // Force the transport into initialized state by setting the private flag.
+    // This is necessary because the MCP SDK rejects tools/call before initialize,
+    // but the client already had a valid session that was lost on server restart.
+    (transport as any)._initialized = true;
+
+    // Now handle the original request with the new (initialized) session
+    await transport.handleRequest(req, res, req.body);
   } else {
-    // New session: pre-generate ID so we can store it before handleRequest
+    // No session ID at all — new session
     const newId = randomUUID();
     const marketplace = new MarketplaceManager();
     marketplace.setUserToken(userToken);
